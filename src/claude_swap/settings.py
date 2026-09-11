@@ -68,7 +68,37 @@ class UiSettings:
     view: str = "combined"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class JobsSettings:
+    """Policy knobs for the job queue (``ccswap jobs``).
+
+    A queued job auto-starts only when an account has *spare* capacity: the
+    binding window's remaining percentage, minus a forecast of the user's own
+    burn through the end of that window, minus ``reserve_pct``, must cover the
+    job's estimated cost. ``quiet_minutes`` is how long every interactive
+    Claude Code session must have been idle before the scheduler trusts the
+    forecast — a busy session is the strongest signal the user still wants
+    the capacity themselves.
+    """
+
+    reserve_pct: float = 15.0
+    weekly_reserve_pct: float = 10.0
+    quiet_minutes: float = 20.0
+    max_concurrent: int = 1
+    default_estimate_pct: float = 10.0
+    weekly_cost_ratio: float = 0.15
+    lookback_weeks: int = 4
+    default_permission_mode: str = "acceptEdits"
+    default_model: str | None = None
+    default_effort: str | None = None
+    job_timeout_minutes: float = 120.0
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "jobs": JobsSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -144,6 +174,51 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "ui", "view", "view", "choice",
             choices=("combined", "claude", "codex"),
             help="Dashboard view: both providers, or only one",
+        ),
+        SettingSpec(
+            "jobs", "reservePct", "reserve_pct", "float", 0.0, 80.0,
+            help="Keep this much of the 5h window free of auto-started jobs",
+        ),
+        SettingSpec(
+            "jobs", "weeklyReservePct", "weekly_reserve_pct", "float", 0.0, 80.0,
+            help="Keep this much of the 7d window free of auto-started jobs",
+        ),
+        SettingSpec(
+            "jobs", "quietMinutes", "quiet_minutes", "float", 0.0, 1440.0,
+            help="Interactive sessions must be idle this long before a job auto-starts",
+        ),
+        SettingSpec(
+            "jobs", "maxConcurrent", "max_concurrent", "int", 1, 8,
+            help="Maximum jobs running at once",
+        ),
+        SettingSpec(
+            "jobs", "defaultEstimatePct", "default_estimate_pct", "float", 0.5, 100.0,
+            help="Assumed 5h-window cost of a job with no history, in pct",
+        ),
+        SettingSpec(
+            "jobs", "weeklyCostRatio", "weekly_cost_ratio", "float", 0.01, 1.0,
+            help="7d cost assumed per unit of 5h cost when a job has no history",
+        ),
+        SettingSpec(
+            "jobs", "lookbackWeeks", "lookback_weeks", "int", 1, 12,
+            help="Weeks of usage history used to forecast your own burn",
+        ),
+        SettingSpec(
+            "jobs", "defaultPermissionMode", "default_permission_mode", "choice",
+            choices=("acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"),
+            help="Permission mode for new jobs",
+        ),
+        SettingSpec(
+            "jobs", "defaultModel", "default_model", "string",
+            help="Model for new jobs (empty = Claude Code's default)",
+        ),
+        SettingSpec(
+            "jobs", "defaultEffort", "default_effort", "string",
+            help="Effort level for new jobs (low, medium, high, xhigh, max)",
+        ),
+        SettingSpec(
+            "jobs", "jobTimeoutMinutes", "job_timeout_minutes", "float", 1.0, 1440.0,
+            help="Kill a job that runs longer than this",
         ),
     )
 }
@@ -259,6 +334,46 @@ def load_ui_settings(backup_root: Path) -> UiSettings:
         )
         view = default.view
     return UiSettings(theme=theme, view=view)
+
+
+_JOBS_KEYS: dict[str, str] = {
+    spec.field: spec.json_key
+    for spec in SETTING_SPECS.values()
+    if spec.section == "jobs"
+}
+
+
+def load_jobs_settings(backup_root: Path) -> JobsSettings:
+    """Load the jobs section; missing/corrupt file or bad fields → defaults."""
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("jobs")
+    default = JobsSettings()
+    if not isinstance(section, dict):
+        return default
+    kwargs = {}
+    for spec in SETTING_SPECS.values():
+        if spec.section != "jobs" or spec.json_key not in section:
+            continue
+        value = section[spec.json_key]
+        if spec.kind in ("float", "int"):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            clamped = float(min(max(value, spec.lo), spec.hi))
+            kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
+        elif spec.kind == "bool":
+            kwargs[spec.field] = bool(value)
+        elif spec.kind == "string":
+            if isinstance(value, str) and value:
+                kwargs[spec.field] = value
+        else:  # choice
+            if value in spec.choices:
+                kwargs[spec.field] = value
+            else:
+                _logger.warning(
+                    "settings.json: unsupported %s %r; using %r",
+                    spec.dotted, value, spec.default,
+                )
+    return JobsSettings(**kwargs)
 
 
 def save_settings(backup_root: Path, settings: AutoSwitchSettings) -> None:
@@ -425,6 +540,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "jobs": load_jobs_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():

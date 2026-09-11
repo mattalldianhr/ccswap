@@ -1076,6 +1076,16 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "config":
         _config_command(sys.argv[2:])
         return
+    if argv and argv[0] == "jobs":
+        from claude_swap.jobs_cli import jobs_command
+
+        jobs_command(argv[1:])
+        return
+    if argv and argv[0] == "reserves":
+        from claude_swap.jobs_cli import reserves_command
+
+        reserves_command(argv[1:])
+        return
     if argv and argv[0] == "map":
         _map_command(argv[1:])
         return

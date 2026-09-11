@@ -47,6 +47,7 @@ from claude_swap.poll_policy import (
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
+from claude_swap.usage_history import Sample, UsageHistory
 
 SCHEMA_VERSION = 2
 
@@ -830,6 +831,9 @@ class UsageStore:
         self.path = cache_dir / "usage.json"
         self._lock_path = cache_dir / ".usage.lock"
         self.clock = clock
+        # Trend log for the job scheduler's burn forecast (usage_history.py).
+        # Best-effort: an append failure never affects the snapshot write.
+        self.history = UsageHistory(cache_dir)
 
     # -- raw I/O ------------------------------------------------------------
 
@@ -1134,6 +1138,13 @@ class UsageStore:
                 apply(num, row)
             if accepted:
                 self._write_rows(rows)
+        for num in accepted:
+            rec = outcomes[num]
+            if rec.sentinel is None and rec.error is None and isinstance(rec.usage, dict):
+                email, org = identities[num]
+                self.history.append(
+                    Sample.from_last_good(email, org, rec.usage, now)
+                )
         return accepted
 
     def set_poll_plan(
