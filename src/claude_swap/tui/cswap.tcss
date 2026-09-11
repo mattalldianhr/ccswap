@@ -363,3 +363,50 @@ StartJobModal, JobFormModal {
 JobFormModal Input, JobFormModal Select {
     margin-bottom: 0;
 }
+
+
+/* -- reserves screen -------------------------------------------------------- */
+
+#reserves-title {
+    height: 1;
+    padding: 0 2;
+    margin-top: 1;
+}
+
+#reserves-list {
+    background: $background;
+    padding: 1 1 0 1;
+    scrollbar-size-vertical: 1;
+    height: 1fr;
+    min-height: 3;
+}
+
+#reserves-list ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#reserves-list ListItem.-highlight,
+#reserves-list:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
+#reserves-timeline {
+    height: auto;
+    border-top: solid $panel;
+    padding: 1 2;
+}
+
+ReserveFormModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+#reserveform-box {
+    width: 100;
+    max-width: 96%;
+}

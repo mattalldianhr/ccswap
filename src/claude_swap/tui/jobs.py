@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from rich.text import Text
+from textual.css.query import NoMatches
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -235,7 +236,11 @@ class JobRow(ListItem):
     def set_job(self, job: Job, *, palette: Palette, settings: JobsSettings) -> None:
         self.job = job
         width = (self.size.width or 100) - 2
-        self.query_one(Static).update(job_row_text(job, width, palette=palette, settings=settings))
+        try:
+            static = self.query_one(Static)
+        except NoMatches:
+            return  # row is being removed
+        static.update(job_row_text(job, width, palette=palette, settings=settings))
 
 
 class JobsScreen(Screen):
@@ -252,6 +257,7 @@ class JobsScreen(Screen):
         Binding("minus", "priority_step(10)", "Later", show=False),
         Binding("h", "toggle_history", "History", show=False),
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("R", "app.open_reserves", "Reserves"),
         Binding("escape,q", "back", "Back"),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -293,7 +299,7 @@ class JobsScreen(Screen):
         self._store = JobStore(switcher.backup_dir)
         self._runner = JobRunner(switcher, self._settings, self._store)
         self.query_one("#jobs-list", ListView).focus()
-        self.watch(self.app, "theme", self._on_theme_change)
+        self.watch(self.app, "theme", self._on_theme_change, init=False)
         self._start_engine(dry_run=True)
         self.set_interval(REFRESH_S, self._refresh)
         self._refresh()

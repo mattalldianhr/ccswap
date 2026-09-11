@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from claude_swap.exceptions import ClaudeSwitchError
@@ -76,6 +76,59 @@ def parse_when(value: str | None) -> float | None:
     if dt.tzinfo is None:
         dt = dt.astimezone()
     return dt.timestamp()
+
+
+_UNIT_S = {"m": 60.0, "h": 3600.0, "d": 86400.0, "w": 7 * 86400.0}
+_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def parse_when_relative(
+    value: str | None,
+    *,
+    now: float,
+    next_reset: float | None = None,
+) -> float | None:
+    """Like :func:`parse_when` plus the shorthand the TUI form accepts.
+
+    ``now``; ``open`` / empty → None; ``+3d`` / ``+6h`` / ``+30m`` / ``+1w``;
+    ``next reset`` (the window's next reset, when the caller knows it);
+    ``fri`` / ``fri 18:00`` (the next such weekday, today if the time is
+    still ahead). Anything else goes through :func:`parse_when`.
+    """
+    if value is None:
+        return None
+    text = value.strip().lower()
+    if text in ("", "open", "never", "none"):
+        return None
+    if text == "now":
+        return now
+    if text in ("next reset", "reset", "next-reset"):
+        if next_reset is None:
+            raise ReserveError("'next reset' needs a window with a known reset time")
+        return next_reset
+    if text.startswith("+") and len(text) >= 3 and text[-1] in _UNIT_S:
+        try:
+            amount = float(text[1:-1])
+        except ValueError:
+            raise ReserveError(f"Could not parse '{value}'; try +3d, +6h, +30m") from None
+        return now + amount * _UNIT_S[text[-1]]
+    parts = text.split()
+    if parts and parts[0][:3] in _WEEKDAYS:
+        target = _WEEKDAYS.index(parts[0][:3])
+        hour, minute = 0, 0
+        if len(parts) > 1:
+            try:
+                hh, mm = parts[1].split(":")
+                hour, minute = int(hh), int(mm)
+            except ValueError:
+                raise ReserveError(f"Could not parse time in '{value}'; use HH:MM") from None
+        base = datetime.fromtimestamp(now).astimezone()
+        days_ahead = (target - base.weekday()) % 7
+        candidate = base.replace(hour=hour, minute=minute, second=0, microsecond=0) + timedelta(days=days_ahead)
+        if candidate.timestamp() <= now:
+            candidate += timedelta(days=7)
+        return candidate.timestamp()
+    return parse_when(value)
 
 
 def format_when(ts: float | None) -> str:

@@ -531,6 +531,13 @@ class CswapApp(App):
             return
         self.push_screen(JobsScreen())
 
+    def action_open_reserves(self) -> None:
+        from claude_swap.tui.reserves import ReservesScreen
+
+        if isinstance(self.screen, ReservesScreen):
+            return
+        self.push_screen(ReservesScreen())
+
     # -- theme --------------------------------------------------------------
 
     def _resolved_theme(self) -> str:

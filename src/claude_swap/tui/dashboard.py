@@ -93,6 +93,7 @@ class DashboardScreen(Screen):
             ("Watch accounts", "watch"),
             ("Auto-switch view…", "auto"),
             ("Jobs…", "jobs"),
+            ("Reserves…", "reserves"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
@@ -205,6 +206,7 @@ class DashboardScreen(Screen):
             "switch": self.action_open_switch,
             "watch": app.action_open_watch,
             "jobs": app.action_open_jobs,
+            "reserves": app.action_open_reserves,
             "add-token": app.action_add_token,
             "quit": app.exit,
         }
