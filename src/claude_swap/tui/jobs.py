@@ -257,6 +257,7 @@ class JobsScreen(Screen):
         Binding("minus", "priority_step(10)", "Later", show=False),
         Binding("h", "toggle_history", "History", show=False),
         Binding("l", "toggle_live", "Go live / dry-run"),
+        Binding("c", "app.open_capacity", "Capacity"),
         Binding("R", "app.open_reserves", "Reserves"),
         Binding("escape,q", "back", "Back"),
         Binding("j", "cursor_down", show=False),

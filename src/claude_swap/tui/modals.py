@@ -157,3 +157,48 @@ class OutputModal(ModalScreen[None]):
 
     def action_dismiss_modal(self) -> None:
         self.dismiss(None)
+
+
+class ValueModal(ModalScreen["str | None"]):
+    """One-line value entry for a setting: shows the key, its help, and the
+    current value; Enter returns the raw string (validation is the caller's),
+    Esc cancels. An empty submission returns "" so the caller can unset."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=False),
+        Binding("left", "app.focus_previous", show=False),
+        Binding("right", "app.focus_next", show=False),
+    ]
+
+    def __init__(self, title: str, help_text: str, current: str, *, placeholder: str = "") -> None:
+        super().__init__()
+        self._title = title
+        self._help = help_text
+        self._current = current
+        self._placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box"):
+            yield Label(self._title, classes="modal-title")
+            yield Static(self._help, classes="modal-body")
+            yield Input(self._current, id="value", placeholder=self._placeholder)
+            yield Static("", id="form-error", classes="form-error")
+            with Horizontal(classes="modal-buttons"):
+                yield Button("Save", id="save")
+                yield Button("Cancel", id="cancel")
+            yield Static("enter save  ·  empty = default  ·  esc cancel", classes="modal-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#value", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+        else:
+            self.dismiss(self.query_one("#value", Input).value.strip())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)

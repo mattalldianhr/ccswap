@@ -538,6 +538,13 @@ class CswapApp(App):
             return
         self.push_screen(ReservesScreen())
 
+    def action_open_capacity(self) -> None:
+        from claude_swap.tui.capacity import CapacityScreen
+
+        if isinstance(self.screen, CapacityScreen):
+            return
+        self.push_screen(CapacityScreen())
+
     # -- theme --------------------------------------------------------------
 
     def _resolved_theme(self) -> str:

@@ -171,8 +171,55 @@ class DashboardScreen(Screen):
             (f"Dashboard view: {view_labels[self.app._view]}", "setting:view"),
             (f"Auto-switch threshold: {threshold_label}%", "setting:threshold"),
             (f"Auto-switch strategy: {self.app._strategy_name}", "setting:strategy"),
+            ("Jobs…", "jobs-settings-menu"),
             _BACK,
         ]
+
+    _JOBS_SETTING_KEYS = (
+        ("jobs.reservePct", "5h reserve floor"),
+        ("jobs.weeklyReservePct", "7d reserve floor"),
+        ("jobs.quietMinutes", "Quiet period (min)"),
+        ("jobs.maxConcurrent", "Max concurrent jobs"),
+        ("jobs.defaultPermissionMode", "Default permissions"),
+        ("jobs.defaultModel", "Default model"),
+        ("jobs.defaultEffort", "Default effort"),
+        ("jobs.defaultEstimatePct", "Default estimate (% of 5h)"),
+        ("jobs.jobTimeoutMinutes", "Job timeout (min)"),
+    )
+
+    def _jobs_settings_entries(self) -> MenuEntries:
+        """One row per jobs.* setting; choices cycle in place, numbers and
+        strings open a value modal. Plus the launchd scheduler daemon."""
+        from claude_swap.settings import SETTING_SPECS, effective_settings, format_setting_value
+
+        backup = self.app.switcher_for("claude").backup_dir
+        try:
+            rows = {spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(backup)}
+        except Exception:
+            rows = {}
+        entries: MenuEntries = []
+        for key, label in self._JOBS_SETTING_KEYS:
+            spec = SETTING_SPECS[key]
+            value, is_set = rows.get(key, (spec.default, False))
+            shown = format_setting_value(value)
+            if spec.kind == "float" and key.endswith("Pct"):
+                shown += "%"
+            entries.append((f"{label}: {shown}{'' if is_set else '  (default)'}", f"jobsetting:{key}"))
+        entries.append((f"Scheduler daemon: {self._daemon_status()}", "jobs-daemon"))
+        entries.append(_BACK)
+        return entries
+
+    @staticmethod
+    def _daemon_status() -> str:
+        import sys
+        from pathlib import Path
+
+        if sys.platform != "darwin":
+            return "launchd only (macOS)"
+        from claude_swap.jobs_cli import LAUNCHD_LABEL
+
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+        return "installed → remove" if plist.exists() else "not installed → install"
 
     async def _push_menu(self, title: str, entries: MenuEntries) -> None:
         self._menu_stack.append((title, entries))
@@ -238,6 +285,12 @@ class DashboardScreen(Screen):
             app.confirm_remove(provider, number, email)
         elif action_id == "settings-menu":
             await self._push_menu("settings", self._settings_entries())
+        elif action_id == "jobs-settings-menu":
+            await self._push_menu("settings › jobs", self._jobs_settings_entries())
+        elif action_id.startswith("jobsetting:"):
+            await self._edit_jobs_setting(action_id.split(":", 1)[1])
+        elif action_id == "jobs-daemon":
+            await self._toggle_jobs_daemon()
         elif action_id.startswith("setting:"):
             key = action_id.split(":", 1)[1]
             if key == "theme":
@@ -288,6 +341,76 @@ class DashboardScreen(Screen):
             await self._pop_menu()
         else:
             actions[action_id]()
+
+    # -- jobs settings ----------------------------------------------------------
+
+    async def _refresh_jobs_settings_menu(self) -> None:
+        menu = self.query_one("#menu", ListView)
+        index = menu.index
+        self._menu_stack[-1] = ("settings › jobs", self._jobs_settings_entries())
+        await self._render_menu()
+        menu.index = index
+
+    async def _edit_jobs_setting(self, key: str) -> None:
+        from claude_swap.settings import (
+            SETTING_SPECS, effective_settings, format_setting_value, set_setting, unset_setting,
+        )
+        from claude_swap.tui.modals import ValueModal
+
+        app = self.app
+        backup = app.switcher_for("claude").backup_dir
+        spec = SETTING_SPECS[key]
+        current = next((v for s, v, _ in effective_settings(backup) if s.dotted == key), spec.default)
+        if spec.kind == "choice":
+            order = spec.choices
+            value = order[(order.index(current) + 1) % len(order)] if current in order else order[0]
+            try:
+                set_setting(backup, key, value)
+                app.notify(f"{key} = {value}")
+            except Exception as exc:  # noqa: BLE001
+                app.notify(f"Could not save {key}: {exc}", severity="warning")
+            await self._refresh_jobs_settings_menu()
+            return
+        bounds = ""
+        if spec.lo is not None and spec.hi is not None:
+            bounds = f"  ({format_setting_value(spec.lo)}–{format_setting_value(spec.hi)})"
+        shown = "" if current is None else format_setting_value(current)
+
+        def _apply(raw: str | None) -> None:
+            if raw is None:
+                return
+            try:
+                if raw == "":
+                    unset_setting(backup, key)
+                    app.notify(f"{key} reset to default")
+                else:
+                    value = set_setting(backup, key, raw)
+                    app.notify(f"{key} = {format_setting_value(value)}")
+            except Exception as exc:  # noqa: BLE001
+                app.notify(f"Could not save {key}: {exc}", severity="warning")
+            self.run_worker(self._refresh_jobs_settings_menu(), exclusive=False)
+
+        app.push_screen(
+            ValueModal(key, f"{spec.help}{bounds}", shown, placeholder=format_setting_value(spec.default)),
+            _apply,
+        )
+
+    async def _toggle_jobs_daemon(self) -> None:
+        import sys
+        from argparse import Namespace
+
+        from claude_swap.jobs_cli import LAUNCHD_LABEL, _daemon
+        from claude_swap.tui.data import run_action
+
+        app = self.app
+        if sys.platform != "darwin":
+            app.notify("The scheduler daemon uses launchd and is macOS-only", severity="warning")
+            return
+        installed = "installed" in self._daemon_status()
+        op = "uninstall" if installed else "install"
+        result = run_action(lambda: _daemon(Namespace(op=op, interval=300), switcher=app.switcher_for("claude")))
+        app.notify(result.first_line or f"{op} {LAUNCHD_LABEL}", severity="information" if result.ok else "error")
+        await self._refresh_jobs_settings_menu()
 
     # -- actions ----------------------------------------------------------------
 
