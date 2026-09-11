@@ -165,6 +165,34 @@ Run `ccswap` on its own (or `ccswap tui`) for the full-screen dashboard: Claude 
 
 <img src="assets/tui-watch.png" width="760" alt="ccswap watch — live 5h/7d usage bars for every account, with reset times and the active account marked">
 
+### Jobs: use spare capacity for headless work
+
+`ccswap jobs` is a queue of headless `claude -p` runs, each bound to a folder, that start on their own when your subscription has capacity you are not going to use. Every job carries its own **model**, **effort level**, **permission mode**, allowed tools, turn cap, priority, and a cost estimate in percentage points of the 5h window; the estimate is replaced by the measured usage delta after each run, so forecasts improve with every job.
+
+```bash
+ccswap jobs add ~/proj "Fix the flaky test in tests/test_io.py" --name flaky
+ccswap jobs add . -f prompt.md --model opus --effort high --permission-mode acceptEdits
+ccswap jobs list                    # queue, running, and recent failures
+ccswap jobs start flaky             # detached, right now, ignoring capacity
+ccswap jobs start flaky --wait      # foreground
+ccswap jobs log flaky               # readable tail of the run (--raw for stream-json)
+ccswap jobs capacity                # what the scheduler sees per account and window
+ccswap jobs auto --once             # one scheduler tick (launchd/cron); exit code = outcome
+ccswap jobs daemon install          # macOS launchd agent, ticks every 5 minutes
+```
+
+**When does a job start?** Each tick the scheduler computes, per account and per window (5h, 7d, and any per-model window such as Fable):
+
+```
+spare = 100 − used − forecast of your own burn through the reset − reserve
+```
+
+The forecast is the larger of your burn rate over the last hour and your typical burn for the remaining weekday/hour slots, learned from `cache/usage_history.jsonl` (seed it from an existing auto-switch log with `ccswap jobs backfill`). A job starts on the account with the most spare only when spare covers its estimate in every window it touches, **and** every interactive Claude Code session has been idle for `jobs.quietMinutes`. Jobs run pinned to their account through a session profile (`ccswap run` machinery), so an auto-switch of your default login never touches a running job. A job whose account is already the active login runs with the plain environment instead.
+
+**Reserves** are date-scheduled safety thresholds: `ccswap reserves add 7d 40 --until 2026-09-16 --note "deadline"` keeps 40% of the 7d window free of auto-started jobs until then; `100` is a blackout. Reserves apply per window, optionally per account, and stack by maximum over the `jobs.reservePct` / `jobs.weeklyReservePct` floors. Manual `ccswap jobs start` ignores reserves and the quiet gate.
+
+In the TUI, **Jobs…** shows the queue with a capacity strip and a detail pane that explains why a job waits, tails a running job, and hosts the scheduler in dry-run (press `l` to go live). `n` opens the job form, `s` starts a job on a chosen account, `c` opens the Capacity screen (forecast breakdown and sparklines), `R` opens Reserves (list plus a 14-day timeline; dates accept `now`, `+3d`, `fri 18:00`, `next reset`). **Settings › Jobs…** edits every `jobs.*` setting and installs or removes the scheduler daemon.
+
 ### Codex accounts
 
 `ccswap` can also save and switch Codex CLI logins. Log into each account with `codex login`, then save it before logging into the next one:
@@ -204,6 +232,8 @@ This will update the stored credentials without creating a duplicate.
 ```bash
 ccswap run 2                     # Run an account in this terminal only (session mode)
 ccswap auto                      # Auto-switch when nearing rate limits (see above)
+ccswap jobs list                 # Headless job queue (see Jobs above)
+ccswap reserves list             # Date-scheduled safety reserves for the job scheduler
 ccswap codex list                # List saved Codex CLI accounts
 ccswap codex switch 2            # Switch the file-backed Codex login
 ccswap config                    # Show or edit settings (see Configuration below)
@@ -255,7 +285,7 @@ ccswap purge                     # Remove all ccswap data
 | macOS | macOS Keychain | `~/.claude-swap-backup/` |
 | Linux / WSL | File-based (inside the backup directory, under `credentials/`) | `${XDG_DATA_HOME:-~/.local/share}/claude-swap/` |
 
-Session-mode profiles (`ccswap run`) live under the backup directory in `sessions/`. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
+Session-mode profiles (`ccswap run`) live under the backup directory in `sessions/`. The job queue (`jobs.json`, logs under `jobs/<id>/`), reserves (`reserves.json`), and the usage trend log (`cache/usage_history.jsonl`) live there too. Tool preferences (`settings.json`) and auto-switch state (`autoswitch_state.json` — cooldown and quarantined accounts; delete it to reset) live in the backup directory root.
 
 On Linux/WSL, set `XDG_DATA_HOME` to override the default location.
 
