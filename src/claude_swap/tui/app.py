@@ -524,6 +524,13 @@ class CswapApp(App):
             return
         self.push_screen(WatchScreen())
 
+    def action_open_jobs(self) -> None:
+        from claude_swap.tui.jobs import JobsScreen
+
+        if isinstance(self.screen, JobsScreen):
+            return
+        self.push_screen(JobsScreen())
+
     # -- theme --------------------------------------------------------------
 
     def _resolved_theme(self) -> str:

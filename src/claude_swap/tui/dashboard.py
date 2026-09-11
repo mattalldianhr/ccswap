@@ -32,6 +32,7 @@ from claude_swap.tui.widgets import (
     AccountItem,
     AccountsPanel,
     CyclingListView,
+    JobsStrip,
     MenuItem,
     ProviderDivider,
 )
@@ -55,6 +56,7 @@ class DashboardScreen(Screen):
         Binding("q", "app.quit", "Quit"),
         # Power shortcuts; the menu is the discoverable path.
         Binding("g", "app.open_auto", "Auto view", show=False),
+        Binding("b", "app.open_jobs", "Jobs", show=False),
         Binding("f", "app.refresh_full", "Refresh usage", show=False),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -72,6 +74,7 @@ class DashboardScreen(Screen):
             provider=None if self.app._view == "combined" else self.app._view,
             id="accounts-panel",
         )
+        yield JobsStrip(id="jobs-strip")
         yield Static("", id="menu-title")
         yield CyclingListView(id="menu")
         yield Footer()
@@ -89,6 +92,7 @@ class DashboardScreen(Screen):
             ("Switch account…", "switch"),
             ("Watch accounts", "watch"),
             ("Auto-switch view…", "auto"),
+            ("Jobs…", "jobs"),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
@@ -200,6 +204,7 @@ class DashboardScreen(Screen):
         actions: dict[str, Callable[[], None]] = {
             "switch": self.action_open_switch,
             "watch": app.action_open_watch,
+            "jobs": app.action_open_jobs,
             "add-token": app.action_add_token,
             "quit": app.exit,
         }

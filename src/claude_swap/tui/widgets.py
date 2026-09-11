@@ -528,3 +528,48 @@ class MenuItem(ListItem):
             item.add_class("menu-item-muted")
         super().__init__(item)
         self.action_id = action_id
+
+
+class JobsStrip(Static):
+    """One line under the accounts panel: the job queue at a glance.
+
+    Reads jobs.json on the app's poll tick (a small JSON file; cheap) and
+    stays empty when there are no jobs, so a user who never queues one
+    never sees it.
+    """
+
+    def on_mount(self) -> None:
+        self.watch(self.app, "snapshots", lambda _snap: self._reload())
+        self.watch(self.app, "theme", lambda _t: self._reload())
+        self._reload()
+
+    def _reload(self) -> None:
+        from claude_swap.jobs import JobStore
+
+        palette = Palette.from_theme(self.app.current_theme)
+        try:
+            switcher = self.app.switcher_for("claude")  # type: ignore[attr-defined]
+            jobs = JobStore(switcher.backup_dir).all()
+        except Exception:  # noqa: BLE001 - the strip must never break the dashboard
+            jobs = []
+        text = Text()
+        active = [j for j in jobs if j.is_active]
+        if not active:
+            self.display = False
+            self.update(text)
+            return
+        self.display = True
+        queued = [j for j in active if j.state == "queued"]
+        running = [j for j in active if j.state == "running"]
+        text.append("jobs", style=palette.muted)
+        text.append(f"  {len(queued)} queued", style=palette.foreground)
+        if running:
+            names = ", ".join(j.name for j in running[:2])
+            text.append(f" · {len(running)} running ", style=palette.accent)
+            text.append(names, style=palette.foreground)
+        else:
+            text.append(" · none running", style=palette.muted)
+        failed = [j for j in jobs if j.state == "failed"]
+        if failed:
+            text.append(f" · {len(failed)} failed", style=palette.sev_crit)
+        self.update(text)

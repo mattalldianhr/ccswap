@@ -203,3 +203,163 @@ ConfirmModal, AddTokenModal, OutputModal {
 AddTokenModal Input {
     margin-bottom: 1;
 }
+
+
+/* -- jobs screen ------------------------------------------------------------ */
+
+#jobs-strip {
+    height: 1;
+    padding: 0 3;
+    background: $background;
+}
+
+#jobs-top {
+    height: auto;
+    background: $background;
+    padding: 1 2 0 2;
+}
+
+#jobs-title-row {
+    height: 1;
+    margin-bottom: 1;
+}
+
+#jobs-badge {
+    width: auto;
+    text-style: bold;
+}
+
+#jobs-badge.dry {
+    background: $panel;
+    color: $warning;
+}
+
+#jobs-badge.live {
+    background: $primary;
+    color: $background;
+}
+
+#jobs-summary {
+    width: 1fr;
+    color: $secondary;
+    padding-left: 2;
+}
+
+#jobs-capacity {
+    height: auto;
+    padding: 0 1 1 1;
+    border-bottom: solid $panel;
+}
+
+#jobs-list {
+    background: $background;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+    height: 1fr;
+    min-height: 4;
+}
+
+#jobs-list ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#jobs-list ListItem.-highlight,
+#jobs-list:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
+#jobs-detail {
+    height: auto;
+    max-height: 12;
+    background: $background;
+    border-top: solid $panel;
+    padding: 0 2;
+}
+
+#joblog-title {
+    height: 1;
+    padding: 0 2;
+    margin-top: 1;
+}
+
+#joblog-prompt-wrap {
+    height: auto;
+    max-height: 8;
+    padding: 0 2;
+    margin-top: 1;
+    border-bottom: solid $panel;
+}
+
+#joblog-stream {
+    background: $background;
+    padding: 0 1;
+    scrollbar-size-vertical: 1;
+}
+
+StartJobModal, JobFormModal {
+    align: center middle;
+    background: $background 60%;
+}
+
+#start-accounts {
+    height: auto;
+    max-height: 8;
+    background: $surface;
+}
+
+#start-accounts ListItem {
+    background: transparent;
+    padding: 0 1;
+}
+
+#start-accounts ListItem.-highlight,
+#start-accounts:focus ListItem.-highlight {
+    background: $panel;
+    border-left: thick $primary;
+}
+
+#jobform-box {
+    width: 96;
+    max-width: 96%;
+    max-height: 95%;
+}
+
+#jobform-scroll {
+    height: auto;
+    max-height: 30;
+    scrollbar-size-vertical: 1;
+}
+
+.form-label {
+    color: $secondary;
+    margin-top: 1;
+}
+
+.form-row {
+    height: auto;
+}
+
+.form-col {
+    width: 1fr;
+    height: auto;
+    margin-right: 2;
+}
+
+.form-help {
+    color: $secondary;
+    height: auto;
+}
+
+#f-prompt {
+    height: 6;
+    min-height: 4;
+}
+
+JobFormModal Input, JobFormModal Select {
+    margin-bottom: 0;
+}
