@@ -119,6 +119,7 @@ Examples:
     p_edit.add_argument("--estimate", type=float)
     p_edit.add_argument("--max-turns", type=int)
     p_edit.add_argument("--auto", choices=("on", "off"))
+    p_edit.add_argument("-f", "--prompt-file", help="Replace the prompt from a file")
     p_edit.add_argument("--repeat", type=float, metavar="MINUTES", help="0 clears")
     p_edit.add_argument("--then", dest="then_job", metavar="JOB", help="'' clears")
     p_edit.add_argument("--weekly-budget", type=float, metavar="PCT", help="0 clears")
@@ -410,6 +411,8 @@ def _edit(args, *, store, switcher, **_) -> int:
         fields["max_turns"] = args.max_turns
     if args.auto is not None:
         fields["auto"] = args.auto == "on"
+    if args.prompt_file:
+        fields["prompt"] = Path(args.prompt_file).expanduser().read_text(encoding="utf-8")
     if args.repeat is not None:
         fields["repeat_minutes"] = args.repeat or None
     if args.then_job is not None:
