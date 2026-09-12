@@ -106,7 +106,13 @@ def event_text(event: JobsEvent, *, palette: Palette) -> Text:
 
 
 def job_row_text(job: Job, width: int, *, palette: Palette, settings: JobsSettings) -> Text:
-    """One queue row: glyph · priority · name · folder · account · knobs · est · last."""
+    """One queue row, sized to ``width`` and never wrapped.
+
+    Tiers: wide (≥ 110) shows folder and the full model·effort·mode knobs;
+    medium (≥ 80) shortens the knobs and narrows the folder; narrow drops
+    folder and knobs and keeps glyph, priority, name, account, estimate,
+    and the status column.
+    """
     glyph = _GLYPH.get(job.state, "?")
     if job.state == "queued" and not job.auto:
         glyph = "◌"
@@ -120,29 +126,53 @@ def job_row_text(job: Job, width: int, *, palette: Palette, settings: JobsSettin
     }.get(job.state, palette.foreground)
     dim = job.state in ("done", "cancelled")
     body = palette.muted if dim else palette.foreground
-
-    knobs = f"{job.model or 'default'} · {job.effort or '—'} · {job.permission_mode}"
     acct = "auto" if job.account == "auto" else f"#{job.account}" if job.account.isdigit() else job.account
-    # Column budget: fixed columns first, the folder gets what is left.
-    fixed = 2 + 5 + 22 + 2 + 8 + 2 + 28 + 2 + 5 + 2
     last = _last_col(job)
-    folder_w = max(10, width - fixed - len(last) - 2)
+    last_style = palette.sev_crit if job.state == "failed" else palette.muted
 
-    text = Text()
+    text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{glyph} ", style=state_style)
-    text.append(f"{job.priority:>3}  ", style=palette.muted)
-    text.append(_fit(job.name, 22), style=state_style if job.state == "running" else body)
-    text.append("  ")
-    text.append(_fit(_short_folder(job.folder), folder_w), style=palette.muted)
-    text.append("  ")
-    text.append(_fit(acct, 8), style=body)
-    text.append("  ")
-    text.append(_fit(knobs, 28), style=palette.muted)
-    text.append("  ")
-    text.append(f"{job.estimate_pct:>4.0f}%", style=body)
-    text.append("  ")
-    text.append(last, style=palette.sev_crit if job.state == "failed" else palette.muted)
+    text.append(f"{job.priority:>3} ", style=palette.muted)
+    name_w = 22 if width >= 80 else max(8, min(22, width - 30))
+    text.append(_fit(job.name, name_w), style=state_style if job.state == "running" else body)
+    text.append(" ")
+    used = 2 + 4 + name_w + 1
+    if width >= 80:
+        knobs = (
+            f"{job.model or 'default'} · {job.effort or '—'} · {job.permission_mode}"
+            if width >= 110
+            else f"{job.model or 'default'}·{job.effort or '—'}·{_short_mode(job.permission_mode)}"
+        )
+        knobs_w = 28 if width >= 110 else 18
+        est_w = 5
+        tail_w = 1 + 6 + 1 + knobs_w + 1 + est_w + 1 + len(last)
+        folder_w = max(6, width - used - tail_w - 1)
+        text.append(_fit(_short_folder(job.folder), folder_w), style=palette.muted)
+        text.append(" ")
+        text.append(_fit(acct, 6), style=body)
+        text.append(" ")
+        text.append(_fit(knobs, knobs_w), style=palette.muted)
+        text.append(" ")
+        text.append(f"{job.estimate_pct:>4.0f}%", style=body)
+        text.append(" ")
+        text.append(last, style=last_style)
+    else:
+        text.append(_fit(acct, 6), style=body)
+        text.append(" ")
+        text.append(f"{job.estimate_pct:>3.0f}%", style=body)
+        text.append(" ")
+        text.append(last, style=last_style)
     return text
+
+
+_MODE_SHORT = {
+    "acceptEdits": "edits", "bypassPermissions": "bypass", "manual": "manual",
+    "dontAsk": "dontAsk", "plan": "plan", "auto": "auto",
+}
+
+
+def _short_mode(mode: str) -> str:
+    return _MODE_SHORT.get(mode, mode)
 
 
 def _last_col(job: Job) -> str:
@@ -189,7 +219,13 @@ def capacity_text(
     palette: Palette,
     settings: JobsSettings,
 ) -> Text:
-    text = Text()
+    """Per-account capacity, never wrapped.
+
+    Wide terminals get the full used/forecast/reserve/spare table per
+    window; narrower ones get one compact ``window used→spare`` cell per
+    window, and the Capacity screen (``c``) carries the rest.
+    """
+    text = Text(no_wrap=True, overflow="ellipsis")
     if caps is None and error is None:
         text.append("capacity: computing…", style=palette.muted)
         return text
@@ -200,36 +236,63 @@ def capacity_text(
     if not caps:
         text.append("capacity: no accounts with usage", style=palette.muted)
         return text
-    # Header
     names = ["5h", "7d"]
     for cap in caps:
         for name in cap.windows:
             if name not in names:
                 names.append(name)
-    text.append(" acct ", style=palette.muted)
-    for name in names:
-        text.append(f"  {name:<6} used  fcst  rsv  spare", style=palette.muted)
+
+    def spare_style(w) -> str:
+        spare = w.spare_pct
+        if spare is None:
+            return palette.muted
+        if w.blackout or spare < 0:
+            return palette.sev_crit
+        if spare < settings.default_estimate_pct:
+            return palette.sev_warn
+        return palette.sev_ok
+
+    full_w = 6 + 30 * len(names)
+    if width >= full_w:
+        text.append(" acct ", style=palette.muted)
+        for name in names:
+            text.append(f"  {name:<6} used  fcst  rsv  spare", style=palette.muted)
+        for cap in caps:
+            text.append("\n")
+            text.append(f" #{cap.number:<4}", style=palette.foreground)
+            for name in names:
+                w = cap.window(name)
+                if w is None:
+                    text.append(f"  {'':<6}    —     —    —      —", style=palette.muted)
+                    continue
+                text.append(f"  {'':<6}", style=palette.muted)
+                text.append(f"{_pct(w.used_pct):>5}", style=palette.severity(w.used_pct))
+                text.append(f" {_pct(w.forecast_pct):>5}", style=palette.muted)
+                text.append(f" {_pct(w.reserve_pct):>4}{'!' if w.blackout else ' '}", style=palette.muted)
+                text.append(f"{_pct(w.spare_pct, signed=True) if w.spare_pct is not None else '   ?':>6}", style=spare_style(w))
+            if cap.usage_error:
+                text.append(f"  {cap.usage_error}", style=palette.sev_warn)
+        return text
+
+    # Compact: "#1  5h 24%→+61%  7d 3%→-10%  Fable 5%→-10%"
+    text.append(" acct  window used→spare", style=palette.muted)
     for cap in caps:
         text.append("\n")
-        text.append(f" #{cap.number:<4}", style=palette.foreground)
+        text.append(f" #{cap.number:<3}", style=palette.foreground)
         for name in names:
             w = cap.window(name)
+            text.append(f"  {name} ", style=palette.muted)
             if w is None:
-                text.append(f"  {'':<6}    —     —    —      —", style=palette.muted)
+                text.append("—", style=palette.muted)
                 continue
-            used = _pct(w.used_pct)
-            spare = w.spare_pct
-            spare_style = (
-                palette.muted if spare is None
-                else palette.sev_crit if w.blackout or spare < 0
-                else palette.sev_warn if spare < settings.default_estimate_pct
-                else palette.sev_ok
+            text.append(_pct(w.used_pct), style=palette.severity(w.used_pct))
+            text.append("→", style=palette.muted)
+            text.append(
+                _pct(w.spare_pct, signed=True) if w.spare_pct is not None else "?",
+                style=spare_style(w),
             )
-            text.append(f"  {'':<6}", style=palette.muted)
-            text.append(f"{used:>5}", style=palette.severity(w.used_pct))
-            text.append(f" {_pct(w.forecast_pct):>5}", style=palette.muted)
-            text.append(f" {_pct(w.reserve_pct):>4}{'!' if w.blackout else ' '}", style=palette.muted)
-            text.append(f"{_pct(spare, signed=True) if spare is not None else '   ?':>6}", style=spare_style)
+            if w.blackout:
+                text.append("!", style=palette.sev_crit)
         if cap.usage_error:
             text.append(f"  {cap.usage_error}", style=palette.sev_warn)
     return text
@@ -240,9 +303,11 @@ class JobRow(ListItem):
         super().__init__(Static("", markup=False))
         self.job = job
 
-    def set_job(self, job: Job, *, palette: Palette, settings: JobsSettings) -> None:
+    def set_job(self, job: Job, *, palette: Palette, settings: JobsSettings, width: int | None = None) -> None:
         self.job = job
-        width = (self.size.width or 100) - 2
+        if width is None:
+            parent_w = self.parent.size.width if self.parent is not None else 0
+            width = (parent_w or self.size.width or 100) - 5  # padding + border + scrollbar
         try:
             static = self.query_one(Static)
         except NoMatches:
@@ -474,9 +539,10 @@ class JobsScreen(Screen):
         jobs = self._visible_jobs(snap)
         rows = list(listview.query(JobRow))
         same_shape = not force and [r.job.id for r in rows] == [j.id for j in jobs]
+        width = self._row_width()
         if same_shape:
             for row, job in zip(rows, jobs):
-                row.set_job(job, palette=palette, settings=self._settings)
+                row.set_job(job, palette=palette, settings=self._settings, width=width)
             return
         selected = self._selected_id
         listview.clear()
@@ -492,10 +558,19 @@ class JobsScreen(Screen):
         else:
             self._selected_id = None
 
+    def _row_width(self) -> int:
+        listview = self.query_one("#jobs-list", ListView)
+        return (listview.size.width or self.size.width or 100) - 5
+
+    def on_resize(self) -> None:
+        self._paint_rows()
+        self._update_capacity()
+
     def _paint_rows(self) -> None:
         palette = Palette.from_theme(self.app.current_theme)
+        width = self._row_width()
         for row in self.query("#jobs-list JobRow"):
-            row.set_job(row.job, palette=palette, settings=self._settings)
+            row.set_job(row.job, palette=palette, settings=self._settings, width=width)
 
     def on_list_view_highlighted(self, event: ListView.Highlighted) -> None:
         item = event.item
