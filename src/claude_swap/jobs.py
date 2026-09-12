@@ -143,6 +143,15 @@ class Job:
     result_text: str | None = None
     runs: tuple[RunRecord, ...] = ()
     extra_args: tuple[str, ...] = ()
+    # Loop-shaped jobs: re-queue this long after a successful run (None =
+    # one-shot); the queue holds it until ``not_before``.
+    repeat_minutes: float | None = None
+    not_before: float | None = None  # POSIX; scheduler skips it until then
+    # Chaining: when this job finishes successfully, re-queue that job.
+    then_job: str | None = None  # job id or exact name
+    # Budget: skip auto-starts once this job's measured 7d cost over the
+    # last 7 days reaches this many pct points (None = unlimited).
+    weekly_budget_pct: float | None = None
 
     # -- derived --------------------------------------------------------------
 
@@ -153,6 +162,29 @@ class Job:
     @property
     def is_active(self) -> bool:
         return self.state in ACTIVE_STATES
+
+    def weekly_spent(self, now: float) -> float:
+        """Measured 7d cost of runs that finished within the last 7 days."""
+        from datetime import datetime, timezone
+
+        total = 0.0
+        for r in self.runs:
+            if r.cost_7d is None:
+                continue
+            try:
+                t = datetime.strptime(r.finished_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+            if now - t <= 7 * 86400:
+                total += r.cost_7d
+        return total
+
+    def over_budget(self, now: float) -> bool:
+        return self.weekly_budget_pct is not None and self.weekly_spent(now) >= self.weekly_budget_pct
+
+    def ready(self, now: float) -> bool:
+        """Queued and past its ``not_before`` hold."""
+        return self.state == "queued" and (self.not_before is None or now >= self.not_before)
 
     def weekly_estimate(self, ratio: float) -> float:
         if self.weekly_estimate_pct is not None:
@@ -211,6 +243,10 @@ class Job:
             result_text=raw.get("result_text") if isinstance(raw.get("result_text"), str) else None,
             runs=runs,
             extra_args=tuple(str(a) for a in (raw.get("extra_args") or [])),
+            repeat_minutes=_num_or_none(raw.get("repeat_minutes")),
+            not_before=_num_or_none(raw.get("not_before")),
+            then_job=raw.get("then_job") if isinstance(raw.get("then_job"), str) and raw.get("then_job") else None,
+            weekly_budget_pct=_num_or_none(raw.get("weekly_budget_pct")),
         )
 
 
@@ -733,7 +769,16 @@ class JobRunner:
             fields["estimate_pct"] = round(c5, 1)
         if c7 is not None and c7 > 0:
             fields["weekly_estimate_pct"] = round(c7, 1)
+        # Loop: a successful run of a repeating job goes straight back to the
+        # queue, held until the cooldown elapses.
+        if not error and job.repeat_minutes:
+            fields.update(
+                state="queued", not_before=finished + job.repeat_minutes * 60.0,
+                started_at=None, worker_pid=None, claude_pid=None,
+            )
         self.store.update(job.id, **fields)
+        if not error and job.then_job:
+            self._chain(job)
         _log(
             self.store, job.id,
             f"finished: {'error: ' + error if error else 'ok'}"
@@ -741,6 +786,21 @@ class JobRunner:
             f" · 7d Δ {c7 if c7 is not None else '?'}",
         )
         return 1 if error else 0
+
+    def _chain(self, job: Job) -> None:
+        """Re-queue the job named by ``then_job`` (no-op if it is running or queued)."""
+        try:
+            nxt = self.store.get(job.then_job or "")
+        except JobError as e:
+            _log(self.store, job.id, f"chain: {e}")
+            return
+        if nxt.id == job.id or nxt.state in ("queued", "running"):
+            return
+        self.store.update(
+            nxt.id, state="queued", error=None, exit_code=None, finished_at=None,
+            started_at=None, worker_pid=None, claude_pid=None, result_text=None, not_before=None,
+        )
+        _log(self.store, job.id, f"chain: queued {nxt.name}")
 
     # -- control --------------------------------------------------------------
 
@@ -766,7 +826,7 @@ class JobRunner:
             raise JobError(f"Job {job.short_id} is running")
         return self.store.update(
             job.id, state="queued", error=None, exit_code=None, finished_at=None,
-            started_at=None, worker_pid=None, claude_pid=None, result_text=None,
+            started_at=None, worker_pid=None, claude_pid=None, result_text=None, not_before=None,
         )
 
 

@@ -422,6 +422,9 @@ class JobsEngine:
         self._report_finished(jobs)
         running = [j for j in jobs if j.state == "running"]
         queued = [j for j in jobs if j.state == "queued" and j.auto]
+        held = [j for j in queued if not j.ready(now)]
+        budgeted = [j for j in queued if j.ready(now) and j.over_budget(now)]
+        queued = [j for j in queued if j.ready(now) and not j.over_budget(now)]
         idle = self.idle(now=now)
         quiet = idle.idle_s is not None and idle.idle_s >= self.settings.quiet_minutes * 60.0
         caps = self.capacities(now=now) if queued else []
@@ -430,6 +433,15 @@ class JobsEngine:
             quiet=quiet, capacities=tuple(caps),
         ))
         if not queued:
+            if held or budgeted:
+                bits = []
+                if held:
+                    soonest = min(j.not_before or now for j in held)
+                    bits.append(f"{len(held)} waiting for cooldown (next in {max(0.0, soonest - now) / 60:.0f}m)")
+                if budgeted:
+                    bits.append(f"{len(budgeted)} over weekly budget")
+                self._emit(HoldEvent(reason="held", detail="; ".join(bits)))
+                return TickOutcome.HELD
             return TickOutcome.NOTHING
         if len(running) >= self.settings.max_concurrent:
             self._emit(HoldEvent(reason="max-concurrent", detail=f"{len(running)} running"))

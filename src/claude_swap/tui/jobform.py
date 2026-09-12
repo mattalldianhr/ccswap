@@ -63,6 +63,9 @@ class JobForm:
     priority: int
     estimate_pct: float
     auto: bool
+    repeat_minutes: float | None = None
+    then_job: str | None = None
+    weekly_budget_pct: float | None = None
 
     def fields(self) -> dict:
         return {
@@ -71,6 +74,8 @@ class JobForm:
             "permission_mode": self.permission_mode, "allowed_tools": self.allowed_tools,
             "max_turns": self.max_turns, "priority": self.priority,
             "estimate_pct": self.estimate_pct, "auto": self.auto,
+            "repeat_minutes": self.repeat_minutes, "then_job": self.then_job,
+            "weekly_budget_pct": self.weekly_budget_pct,
         }
 
     def to_job(self) -> Job:
@@ -174,6 +179,16 @@ class JobFormModal(ModalScreen["JobForm | None"]):
                     with Vertical(classes="form-col"):
                         yield Label("estimate, % of 5h", classes="form-label")
                         yield Input(f"{(job.estimate_pct if job else s.default_estimate_pct):g}", id="f-estimate", type="number")
+                with Horizontal(classes="form-row"):
+                    with Vertical(classes="form-col"):
+                        yield Label("repeat every (minutes, blank = once)", classes="form-label")
+                        yield Input(f"{job.repeat_minutes:g}" if job and job.repeat_minutes else "", id="f-repeat", type="number", placeholder="once")
+                    with Vertical(classes="form-col"):
+                        yield Label("then re-queue job (name or id)", classes="form-label")
+                        yield Input(job.then_job if job and job.then_job else "", id="f-then", placeholder="none")
+                    with Vertical(classes="form-col"):
+                        yield Label("weekly budget, % of 7d (blank = none)", classes="form-label")
+                        yield Input(f"{job.weekly_budget_pct:g}" if job and job.weekly_budget_pct else "", id="f-budget", type="number", placeholder="unlimited")
                 yield Label("start", classes="form-label")
                 yield Select(
                     [("when there is spare capacity", "auto"), ("only by hand", "manual")],
@@ -262,9 +277,23 @@ class JobFormModal(ModalScreen["JobForm | None"]):
             self._error(problem, focus)
             return
         auto = str(self.query_one("#f-auto", Select).value) == "auto"
+        try:
+            repeat_raw = self.query_one("#f-repeat", Input).value.strip()
+            repeat = float(repeat_raw) if repeat_raw else None
+            budget_raw = self.query_one("#f-budget", Input).value.strip()
+            budget = float(budget_raw) if budget_raw else None
+        except ValueError:
+            self._error("Repeat and budget must be numbers.", "#f-repeat")
+            return
+        if repeat is not None and repeat <= 0:
+            repeat = None
+        if budget is not None and budget <= 0:
+            budget = None
+        then_job = self.query_one("#f-then", Input).value.strip() or None
         self.dismiss(JobForm(
             job_id=self._job.id if self._job else None,
             name=name, folder=folder, prompt=prompt, account=account,
             model=model, effort=effort, permission_mode=mode, allowed_tools=tools,
             max_turns=max_turns, priority=priority, estimate_pct=estimate, auto=auto,
+            repeat_minutes=repeat, then_job=then_job, weekly_budget_pct=budget,
         ))

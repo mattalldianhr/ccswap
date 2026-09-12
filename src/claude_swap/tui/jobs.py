@@ -152,7 +152,14 @@ def _last_col(job: Job) -> str:
         who = f" · {job.account_used}" if job.account_used else ""
         return f"{elapsed}{who}"
     if job.state == "queued":
-        return "manual only" if not job.auto else "—"
+        if not job.auto:
+            return "manual only"
+        now = time.time()
+        if job.not_before and job.not_before > now:
+            return f"held {data.format_duration(job.not_before - now)}"
+        if job.over_budget(now):
+            return "over weekly budget"
+        return f"every {job.repeat_minutes:g}m" if job.repeat_minutes else "—"
     if job.state in ("done", "failed", "cancelled") and job.runs:
         r = job.runs[-1]
         cost = f"Δ{r.cost_5h:.0f}%" if r.cost_5h is not None else "Δ?"
@@ -601,6 +608,22 @@ class JobsScreen(Screen):
         text = Text()
         if not job.auto:
             text.append("  manual only — press s to start\n", style=palette.muted)
+            return text
+        now = time.time()
+        loop = []
+        if job.repeat_minutes:
+            loop.append(f"repeats every {job.repeat_minutes:g}m")
+        if job.then_job:
+            loop.append(f"then {job.then_job}")
+        if job.weekly_budget_pct:
+            loop.append(f"weekly budget {job.weekly_spent(now):.1f}/{job.weekly_budget_pct:g}%")
+        if loop:
+            text.append("  " + " · ".join(loop) + "\n", style=palette.muted)
+        if job.not_before and job.not_before > now:
+            text.append(f"  held until {data.format_duration(job.not_before - now)} from now (cooldown)\n", style=palette.sev_warn)
+            return text
+        if job.over_budget(now):
+            text.append("  over its weekly budget — waits for older runs to age out\n", style=palette.sev_warn)
             return text
         caps = self._caps
         if not caps:

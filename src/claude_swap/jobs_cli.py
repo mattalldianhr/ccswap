@@ -81,6 +81,9 @@ Examples:
     p_add.add_argument("--priority", type=int, default=50, help="Lower runs first (default 50)")
     p_add.add_argument("--estimate", type=float, help="Expected 5h-window cost in pct")
     p_add.add_argument("--manual", action="store_true", help="Never auto-start; only `jobs start`")
+    p_add.add_argument("--repeat", type=float, metavar="MINUTES", help="Re-queue this long after each successful run")
+    p_add.add_argument("--then", dest="then_job", metavar="JOB", help="Re-queue that job when this one succeeds")
+    p_add.add_argument("--weekly-budget", type=float, metavar="PCT", help="Skip auto-starts once this job's 7d cost in the last week reaches PCT")
     p_add.add_argument("--", dest="_dashdash", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     p_list = sub.add_parser("list", help="List jobs")
@@ -116,6 +119,9 @@ Examples:
     p_edit.add_argument("--estimate", type=float)
     p_edit.add_argument("--max-turns", type=int)
     p_edit.add_argument("--auto", choices=("on", "off"))
+    p_edit.add_argument("--repeat", type=float, metavar="MINUTES", help="0 clears")
+    p_edit.add_argument("--then", dest="then_job", metavar="JOB", help="'' clears")
+    p_edit.add_argument("--weekly-budget", type=float, metavar="PCT", help="0 clears")
 
     p_log = sub.add_parser("log", help="Show a job's output")
     p_log.add_argument("job")
@@ -193,6 +199,8 @@ def _add(args, *, switcher, settings, store, runner) -> int:
         return 1
     if args.account != ACCOUNT_AUTO:
         switcher.resolve_account(args.account)  # raises on unknown
+    if args.then_job:
+        store.get(args.then_job)  # raises on unknown
     job = Job(
         id=new_job_id(),
         name=args.name or _derive_name(prompt),
@@ -208,6 +216,9 @@ def _add(args, *, switcher, settings, store, runner) -> int:
         estimate_pct=estimate,
         auto=not args.manual,
         extra_args=tuple(getattr(args, "_dashdash", None) or ()),
+        repeat_minutes=args.repeat or None,
+        then_job=args.then_job or None,
+        weekly_budget_pct=args.weekly_budget or None,
     )
     job = store.add(job)
     print(f"{accent('Queued')} {bolded(job.name)} {muted(job.short_id)} in {job.folder}")
@@ -215,6 +226,9 @@ def _add(args, *, switcher, settings, store, runner) -> int:
         f"  account {job.account} · model {job.model or 'default'} · effort {job.effort or 'default'}"
         f" · {job.permission_mode} · priority {job.priority} · est {job.estimate_pct:g}%"
         f"{' · manual only' if not job.auto else ''}"
+        f"{f' · repeats every {job.repeat_minutes:g}m' if job.repeat_minutes else ''}"
+        f"{f' · then {job.then_job}' if job.then_job else ''}"
+        f"{f' · weekly budget {job.weekly_budget_pct:g}%' if job.weekly_budget_pct else ''}"
     ))
     return 0
 
@@ -281,6 +295,17 @@ def _show(args, *, store, settings, **_) -> int:
           f" · {'auto' if job.auto else 'manual only'}")
     if job.max_turns:
         print(f"  max turns  {job.max_turns}")
+    loop = []
+    if job.repeat_minutes:
+        loop.append(f"repeats every {job.repeat_minutes:g} min")
+    if job.not_before and job.state == "queued":
+        loop.append(f"held until {datetime.fromtimestamp(job.not_before).astimezone().strftime('%a %H:%M')}")
+    if job.then_job:
+        loop.append(f"then {job.then_job}")
+    if job.weekly_budget_pct:
+        loop.append(f"weekly budget {job.weekly_spent(time.time()):.1f}/{job.weekly_budget_pct:g}%")
+    if loop:
+        print(f"  loop       {' · '.join(loop)}")
     print(f"  created    {job.created_at}")
     if job.started_at:
         print(f"  started    {job.started_at}" + (f" · finished {job.finished_at}" if job.finished_at else ""))
@@ -385,6 +410,14 @@ def _edit(args, *, store, switcher, **_) -> int:
         fields["max_turns"] = args.max_turns
     if args.auto is not None:
         fields["auto"] = args.auto == "on"
+    if args.repeat is not None:
+        fields["repeat_minutes"] = args.repeat or None
+    if args.then_job is not None:
+        if args.then_job:
+            store.get(args.then_job)
+        fields["then_job"] = args.then_job or None
+    if args.weekly_budget is not None:
+        fields["weekly_budget_pct"] = args.weekly_budget or None
     if not fields:
         error("Error: nothing to change")
         return 1
