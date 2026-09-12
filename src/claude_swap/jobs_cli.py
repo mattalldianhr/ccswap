@@ -108,7 +108,7 @@ Examples:
     p_rm = sub.add_parser("remove", help="Delete a job and its logs")
     p_rm.add_argument("job")
 
-    p_edit = sub.add_parser("edit", help="Change a queued job's settings")
+    p_edit = sub.add_parser("edit", help="Change a job's settings (applies to its next run)")
     p_edit.add_argument("job")
     p_edit.add_argument("--name")
     p_edit.add_argument("--account")

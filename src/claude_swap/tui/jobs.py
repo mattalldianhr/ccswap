@@ -746,9 +746,8 @@ class JobsScreen(Screen):
         job = self._selected()
         if job is None:
             return
-        if job.state not in ("queued", "paused"):
-            self.notify("Only queued jobs can be edited; retry it first", severity="warning")
-            return
+        if job.state == "running":
+            self.notify("Editing a running job; changes apply to its next run", timeout=4)
         self.app.push_screen(
             JobFormModal(job, settings=self._settings, default_folder=job.folder,
                          accounts=self._account_choices()),
