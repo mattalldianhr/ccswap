@@ -24,7 +24,12 @@ from textual.binding import Binding
 from textual.screen import Screen
 from textual.widgets import Footer, Static
 
-from claude_swap.capacity import AccountCapacity, WindowCapacity, windows_for_job
+from claude_swap.capacity import (
+    AccountCapacity,
+    WindowCapacity,
+    pooled_capacity,
+    windows_for_job,
+)
 from claude_swap.jobs import Job, JobStore
 from claude_swap.jobs_engine import JobsEngine
 from claude_swap.pace import WEEKLY_PERIOD_S
@@ -92,6 +97,40 @@ def _p(v: float | None, *, signed: bool = False) -> str:
     if v is None:
         return "?"
     return f"{v:+.0f}%" if signed else f"{v:.0f}%"
+
+
+def pool_text(caps: list[AccountCapacity], *, now: float, palette: Palette, settings: JobsSettings) -> Text:
+    """Capacity across accounts as one budget, with the next refill.
+
+    The accounts' windows reset at different times, so a per-account view can
+    show every account blocked while the pool still has room — the reserve
+    and the burn forecast are charged once here, not once per account.
+    """
+    text = Text(no_wrap=True, overflow="ellipsis")
+    pool = pooled_capacity(caps)
+    if not pool:
+        return text
+    text.append(" pooled", style=palette.foreground)
+    text.append("  reserve + forecast counted once\n", style=palette.muted)
+    text.append(f" {'window':8} {'left':>6} {'fcst':>6} {'rsv':>5} {'spare':>7} {'best':>6}  next refill\n",
+                style=palette.muted)
+    for name, w in pool.items():
+        style = (
+            palette.sev_crit if w.blackout or w.spare_pct < 0
+            else palette.sev_warn if w.spare_pct < settings.default_estimate_pct
+            else palette.sev_ok
+        )
+        refill = "—"
+        if w.next_reset is not None:
+            refill = f"#{w.next_reset_account} in {max(0.0, w.next_reset - now) / 3600:.0f}h"
+        text.append(f" {name:8}", style=palette.foreground)
+        text.append(f" {w.remaining_pct:>5.0f}%", style=palette.muted)
+        text.append(f" {w.forecast_pct:>5.0f}%", style=palette.muted)
+        text.append(f" {w.reserve_pct:>4.0f}%", style=palette.muted)
+        text.append(f" {w.spare_pct:>+6.0f}%", style=style)
+        text.append(f" {w.best_single():>5.0f}%", style=palette.muted)
+        text.append(f"  {refill}\n", style=palette.muted)
+    return text
 
 
 def window_table(cap: AccountCapacity, *, palette: Palette, settings: JobsSettings) -> Text:
@@ -224,6 +263,7 @@ class CapacityScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="cap-title")
+        yield Static("", id="cap-pool")
         yield Static("", id="cap-table")
         yield Static("", id="cap-charts")
         yield Static("", id="cap-fit")
@@ -303,6 +343,7 @@ class CapacityScreen(Screen):
         if view.error:
             title.append(f"   {view.error}", style=palette.sev_warn)
             self.query_one("#cap-title", Static).update(title)
+            self.query_one("#cap-pool", Static).update("")
             self.query_one("#cap-table", Static).update("")
             self.query_one("#cap-charts", Static).update("")
             self.query_one("#cap-fit", Static).update("")
@@ -328,6 +369,9 @@ class CapacityScreen(Screen):
         elif cap.usage_age_s is not None:
             title.append(f"   usage {data.format_duration(cap.usage_age_s)} old", style=palette.muted)
         self.query_one("#cap-title", Static).update(title)
+        self.query_one("#cap-pool", Static).update(
+            pool_text(list(view.caps), now=view.taken_at, palette=palette, settings=self._settings)
+        )
         self.query_one("#cap-table", Static).update(window_table(cap, palette=palette, settings=self._settings))
         width = (self.size.width or 100) - 4
         self.query_one("#cap-charts", Static).update(

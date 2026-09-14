@@ -29,6 +29,7 @@ from claude_swap.jobs import (
     tail_stream_text,
     validate_job_fields,
 )
+from claude_swap.capacity import pooled_capacity
 from claude_swap.jobs_engine import JobsEngine, capacity_to_json
 from claude_swap.mappings import normalize_path
 from claude_swap.printer import accent, bolded, dimmed, error, muted, warning
@@ -458,6 +459,19 @@ def _capacity(args, *, switcher, settings, store, runner, **_) -> int:
             "idleSeconds": None if idle.idle_s == float("inf") else idle.idle_s,
             "quietMinutes": settings.quiet_minutes,
             "accounts": [capacity_to_json(c) for c in caps],
+            "pooled": {
+                name: {
+                    "remainingPct": w.remaining_pct,
+                    "forecastPct": w.forecast_pct,
+                    "reservePct": w.reserve_pct,
+                    "sparePct": w.spare_pct,
+                    "bestSinglePct": w.best_single(),
+                    "accounts": w.accounts,
+                    "nextReset": w.next_reset,
+                    "nextResetAccount": w.next_reset_account,
+                }
+                for name, w in pooled_capacity(caps).items()
+            },
         }, indent=2))
         return 0
     idle_txt = "no interactive sessions" if idle.idle_s == float("inf") else (
@@ -505,6 +519,22 @@ def _capacity(args, *, switcher, settings, store, runner, **_) -> int:
                 detail.append(f"typical → {w.typical_forecast_pct:.0f}% ({w.samples} samples)")
             if detail:
                 print(dimmed("           " + " · ".join(detail)))
+    pool = pooled_capacity(caps)
+    if pool:
+        print(f"\n{bolded('Pooled')} (reserve and forecast counted once across accounts)")
+        print(dimmed(f"  {'window':8} {'remaining':>10} {'forecast':>9} {'reserve':>8} {'spare':>7}  next refill"))
+        for name, w in pool.items():
+            refill = "—"
+            if w.next_reset is not None:
+                hours = max(0.0, w.next_reset - now) / 3600
+                refill = f"#{w.next_reset_account} in {hours:.0f}h"
+            style = accent if w.spare_pct >= settings.default_estimate_pct else warning_text
+            print(
+                f"  {name:8} {w.remaining_pct:>9.0f}% {w.forecast_pct:>8.0f}%"
+                f" {w.reserve_pct:>7.0f}% {style(f'{w.spare_pct:+.0f}%'):>7}  {refill}"
+                + dimmed(f"   (best single {w.best_single():.0f}%)")
+            )
+
     queued = store.queued(auto_only=True)
     if queued:
         print()

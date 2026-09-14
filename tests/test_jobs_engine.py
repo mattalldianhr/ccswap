@@ -245,3 +245,71 @@ class TestTick:
         for e in events:
             json.dumps(e.to_json())
             assert e.human()
+
+
+class TestPooledDecisions:
+    """The pool decides affordability; a single account must hold the job."""
+
+    def _engine(self, harness, tmp_path, entries, **settings):
+        events: list = []
+        store = JobStore(harness.switcher.backup_dir)
+        engine = JobsEngine(
+            harness.switcher, JobsSettings(quiet_minutes=0, **settings), events.append,
+            store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+        )
+        return engine, store, events, patch.object(
+            harness.switcher, "usage_entries_by_account", return_value=entries)
+
+    def test_reserve_no_longer_charged_twice(self, harness, tmp_path):
+        """Both accounts 45% used with a 10% reserve. Per-account each has 45
+        spare; the pool has 110 minus one reserve — a 50% job fits the pool
+        and account 1 has the room to run it."""
+        entries = {"1": _entry(0, 45, now=NOW), "2": _entry(0, 45, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=10)
+        _queue(store, tmp_path, estimate_pct=5.0, weekly_estimate_pct=50.0)
+        with p:
+            assert engine.tick() is TickOutcome.STARTED
+
+    def test_pool_blocks_when_together_they_cannot_afford_it(self, harness, tmp_path):
+        entries = {"1": _entry(0, 95, now=NOW), "2": _entry(0, 95, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=10)
+        _queue(store, tmp_path, estimate_pct=5.0, weekly_estimate_pct=30.0)
+        with p:
+            assert engine.tick() is TickOutcome.HELD
+
+    def test_job_larger_than_any_single_account_is_held(self, harness, tmp_path):
+        """The pool can afford 80 points, but no single account holds 80 —
+        and a run cannot be split."""
+        entries = {"1": _entry(0, 55, now=NOW), "2": _entry(0, 55, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=0)
+        _queue(store, tmp_path, estimate_pct=5.0, weekly_estimate_pct=80.0)
+        with p:
+            assert engine.tick() is TickOutcome.HELD
+
+    def test_exhausted_account_does_not_veto_the_other(self, harness, tmp_path):
+        """Matt's 2026-09-14 shape: one weekly window spent, the other half
+        free. Per-account both read -10 spare; pooled, account 1 can run."""
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 100, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=10)
+        _queue(store, tmp_path, estimate_pct=5.0, weekly_estimate_pct=8.0)
+        with p:
+            assert engine.tick() is TickOutcome.STARTED
+        start = events[-1]
+        assert isinstance(start, StartEvent) and start.account == "a@example.com"
+
+    def test_pinned_job_judged_against_its_own_account(self, harness, tmp_path):
+        entries = {"1": _entry(0, 20, now=NOW), "2": _entry(0, 100, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=0)
+        _queue(store, tmp_path, account="2", estimate_pct=5.0, weekly_estimate_pct=20.0)
+        with p:
+            assert engine.tick() is TickOutcome.HELD
+
+    def test_hold_names_the_next_refill(self, harness, tmp_path):
+        entries = {"1": _entry(0, 99, now=NOW), "2": _entry(0, 99, now=NOW)}
+        engine, store, events, p = self._engine(harness, tmp_path, entries, weekly_reserve_pct=10)
+        _queue(store, tmp_path, estimate_pct=5.0, weekly_estimate_pct=30.0)
+        with p:
+            engine.tick()
+        hold = events[-1]
+        assert hold.reason == "no-capacity"
+        assert "pooled spare" in hold.detail and "refills in" in hold.detail

@@ -42,7 +42,14 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_swap.capacity import AccountCapacity, account_capacity, windows_for_job
+from claude_swap.capacity import (
+    AccountCapacity,
+    PooledWindow,
+    account_capacity,
+    next_refill,
+    pooled_capacity,
+    windows_for_job,
+)
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.jobs import ACCOUNT_AUTO, Job, JobError, JobRunner, JobStore
 from claude_swap.process_detection import ClaudeSession, scan_sessions
@@ -182,6 +189,14 @@ class ErrorEvent(JobsEvent):
 
 def _pct(value: float | None) -> str:
     return "?" if value is None else f"{value:.0f}%"
+
+
+def _any_windows(caps: list[AccountCapacity]) -> dict:
+    """Union of window names across accounts, for model matching."""
+    out: dict = {}
+    for cap in caps:
+        out.update(cap.windows)
+    return out
 
 
 def capacity_to_json(cap: AccountCapacity) -> dict:
@@ -368,37 +383,73 @@ class JobsEngine:
 
     # -- policy ----------------------------------------------------------------
 
+    def _need(self, job: Job, window: str) -> float:
+        """What ``job`` costs against one window."""
+        if window == "5h":
+            return job.estimate_pct
+        return job.weekly_estimate(self.settings.weekly_cost_ratio)
+
+    def pool_allows(self, job: Job, capacities: list[AccountCapacity]) -> bool:
+        """Whether the accounts *together* can afford this job.
+
+        The reserve and the burn forecast protect the user, not any single
+        account: the user spends from one account at a time, so charging both
+        to every account reserves capacity that was never at risk. This asks
+        the question once, against the pool.
+        """
+        pool = pooled_capacity(capacities)
+        for name in windows_for_job(job.model, _any_windows(capacities)):
+            pooled = pool.get(name)
+            if pooled is None:
+                continue  # no account reports it; the per-account check decides
+            if pooled.blackout or pooled.spare_pct < self._need(job, name):
+                return False
+        return True
+
     def choose(
         self, job: Job, capacities: list[AccountCapacity]
     ) -> tuple[AccountCapacity, float] | None:
-        """The account with the largest binding spare that fits ``job``."""
+        """The account to run ``job`` on, or None.
+
+        Two questions, and both must pass. The pool decides whether the job
+        is affordable at all (reserve and forecast counted once across
+        accounts). Then a single account must hold the job's own cost, since
+        a run cannot be split — judged on that account's *remaining*, because
+        the pool already accounted for the reserve and forecast.
+        """
         pinned: tuple[str, str, str] | None = None
         if job.account != ACCOUNT_AUTO:
             try:
                 pinned = self.switcher.resolve_account(job.account)
             except ClaudeSwitchError:
                 return None
+        eligible = [
+            cap for cap in capacities
+            if (pinned is None or cap.number == pinned[0])
+            and cap.windows
+            and not (cap.usage_age_s is not None and cap.usage_age_s > USAGE_TRUST_S)
+        ]
+        if not eligible:
+            return None
+        # A pinned job is judged against its own account alone: the pool is
+        # irrelevant when only one account may run it.
+        if not self.pool_allows(job, eligible):
+            return None
         best: tuple[AccountCapacity, float] | None = None
-        for cap in capacities:
-            if pinned is not None and cap.number != pinned[0]:
-                continue
-            if cap.usage_error and not cap.windows:
-                continue
-            if cap.usage_age_s is not None and cap.usage_age_s > USAGE_TRUST_S:
-                continue
+        for cap in eligible:
             windows = windows_for_job(job.model, cap.windows)
             fits = True
             binding: float | None = None
             for name in windows:
                 w = cap.window(name)
-                if w is None or w.spare_pct is None or w.blackout:
+                if w is None or w.used_pct is None or w.blackout:
                     fits = False
                     break
-                need = job.estimate_pct if name == "5h" else job.weekly_estimate(self.settings.weekly_cost_ratio)
-                if w.spare_pct < need:
+                left = max(0.0, 100.0 - w.used_pct)
+                if left < self._need(job, name):
                     fits = False
                     break
-                binding = w.spare_pct if binding is None else min(binding, w.spare_pct)
+                binding = left if binding is None else min(binding, left)
             if not fits or binding is None:
                 continue
             if best is None or binding > best[1]:
@@ -506,11 +557,20 @@ class JobsEngine:
 
 
 def _no_capacity_detail(queued: list[Job], caps: list[AccountCapacity]) -> str:
+    """Why nothing started, and when that might change."""
     if not caps:
         return "no account usage available"
     first = queued[0]
+    windows = windows_for_job(first.model, _any_windows(caps))
+    pool = pooled_capacity(caps)
     bits = []
-    for cap in caps:
-        spare = cap.spare_for(windows_for_job(first.model, cap.windows))
-        bits.append(f"#{cap.number} spare {_pct(spare)}")
-    return f"{first.name} needs {first.estimate_pct:.0f}%; " + ", ".join(bits)
+    for name in windows:
+        pooled = pool.get(name)
+        if pooled is not None:
+            bits.append(f"{name} pooled spare {_pct(pooled.spare_pct)}")
+    refill = next_refill(pool, windows)
+    when = ""
+    if refill is not None:
+        seconds = max(0.0, refill[0] - time.time())
+        when = f"; #{refill[2]}'s {refill[1]} refills in {seconds / 3600:.0f}h"
+    return f"{first.name} needs {first.estimate_pct:.0f}%; " + ", ".join(bits) + when

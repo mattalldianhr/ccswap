@@ -348,3 +348,111 @@ def windows_for_job(model: str | None, available: dict[str, WindowCapacity]) -> 
 
 def utc_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+
+
+# -- pooled capacity -----------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PooledWindow:
+    """One window's capacity across every account, treated as one budget.
+
+    Per-account accounting double-counts two things. The reserve is held on
+    each account, but the user spends from one account at a time, so holding
+    it twice reserves capacity that was never at risk. The burn forecast has
+    the same shape: the user has one appetite, and requiring every account to
+    survive the *whole* forecast independently is the same error again.
+
+    Pooling fixes both: sum the remaining across accounts, subtract one
+    reserve and one forecast. ``per_account`` keeps each member's own
+    remaining, because a job runs on a single account and cannot be split.
+    """
+
+    window: str
+    remaining_pct: float  # summed 100-used across accounts with known usage
+    forecast_pct: float  # the user's own expected burn, counted once
+    reserve_pct: float  # the largest reserve any member carries, once
+    spare_pct: float
+    accounts: int  # how many accounts contributed
+    per_account: dict[str, float]  # number → that account's own remaining
+    next_reset: float | None  # soonest reset among the accounts, POSIX
+    next_reset_account: str | None
+    blackout: bool  # every contributing account is blacked out
+
+    def best_single(self) -> float:
+        """Most remaining on any one account — the cap for one job."""
+        return max(self.per_account.values(), default=0.0)
+
+
+def pool_window(caps: list[AccountCapacity], window: str) -> PooledWindow | None:
+    """Pool one window across accounts. None when no account reports it."""
+    remaining = 0.0
+    forecast = 0.0
+    reserve = 0.0
+    per_account: dict[str, float] = {}
+    next_reset: float | None = None
+    next_reset_account: str | None = None
+    contributing = 0
+    blackouts = 0
+    for cap in caps:
+        w = cap.window(window)
+        if w is None or w.used_pct is None:
+            continue
+        contributing += 1
+        left = max(0.0, 100.0 - w.used_pct)
+        remaining += left
+        per_account[cap.number] = left
+        # One appetite, so the forecast is the largest single-account
+        # prediction rather than their sum: whichever account the user works
+        # on, that is roughly what they will spend.
+        forecast = max(forecast, w.forecast_pct)
+        reserve = max(reserve, w.reserve_pct)
+        if w.blackout:
+            blackouts += 1
+        if w.resets_at is not None and (next_reset is None or w.resets_at < next_reset):
+            next_reset, next_reset_account = w.resets_at, cap.number
+    if not contributing:
+        return None
+    return PooledWindow(
+        window=window,
+        remaining_pct=remaining,
+        forecast_pct=forecast,
+        reserve_pct=reserve,
+        spare_pct=remaining - forecast - reserve,
+        accounts=contributing,
+        per_account=per_account,
+        next_reset=next_reset,
+        next_reset_account=next_reset_account,
+        blackout=blackouts == contributing,
+    )
+
+
+def pooled_capacity(caps: list[AccountCapacity]) -> dict[str, PooledWindow]:
+    """Every window any account reports, pooled."""
+    names: list[str] = [WINDOW_5H, WINDOW_7D]
+    for cap in caps:
+        for name in cap.windows:
+            if name not in names:
+                names.append(name)
+    out: dict[str, PooledWindow] = {}
+    for name in names:
+        pooled = pool_window(caps, name)
+        if pooled is not None:
+            out[name] = pooled
+    return out
+
+
+def next_refill(pool: dict[str, PooledWindow], windows: tuple[str, ...]) -> tuple[float, str, str] | None:
+    """(timestamp, window, account) of the soonest reset among ``windows``.
+
+    What a held job is waiting for — a hold that names the refill is far more
+    useful than one that just says there is no capacity.
+    """
+    best: tuple[float, str, str] | None = None
+    for name in windows:
+        pooled = pool.get(name)
+        if pooled is None or pooled.next_reset is None or pooled.next_reset_account is None:
+            continue
+        if best is None or pooled.next_reset < best[0]:
+            best = (pooled.next_reset, name, pooled.next_reset_account)
+    return best

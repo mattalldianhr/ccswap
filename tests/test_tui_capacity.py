@@ -104,3 +104,22 @@ class TestCapacityScreen:
             await _open(pilot)
             title = str(app.screen.query_one("#cap-title", Static).render())
             assert "store exploded" in title
+
+
+@pytest.mark.asyncio
+class TestPooledPane:
+    async def test_pool_row_shows_combined_budget_and_refill(self, fake, tmp_path):
+        app = make_app(fake)
+        async with app.run_test(size=(130, 48)) as pilot:
+            await _open(pilot)
+            pool = str(app.screen.query_one("#cap-pool", Static).render())
+            assert "pooled" in pool and "counted once" in pool
+            assert "5h" in pool and "7d" in pool
+            assert "best" in pool and "next refill" in pool
+
+    async def test_pool_hidden_on_error(self, fake, tmp_path):
+        fake.usage_entries_by_account = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("down"))
+        app = make_app(fake)
+        async with app.run_test(size=(130, 48)) as pilot:
+            await _open(pilot)
+            assert str(app.screen.query_one("#cap-pool", Static).render()).strip() == ""

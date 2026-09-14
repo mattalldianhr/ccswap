@@ -420,6 +420,12 @@ ReserveFormModal {
     margin-top: 1;
 }
 
+#cap-pool {
+    height: auto;
+    padding: 1 2 0 2;
+    border-bottom: solid $panel;
+}
+
 #cap-table {
     height: auto;
     padding: 1 2 0 2;

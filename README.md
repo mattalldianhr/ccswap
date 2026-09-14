@@ -181,11 +181,15 @@ ccswap jobs auto --once             # one scheduler tick (launchd/cron); exit co
 ccswap jobs daemon install          # macOS launchd agent, ticks every 5 minutes
 ```
 
-**When does a job start?** Each tick the scheduler computes, per account and per window (5h, 7d, and any per-model window such as Fable):
+**When does a job start?** Each tick the scheduler asks two questions. First, can the accounts *together* afford the job? Per window (5h, 7d, and any per-model window such as Fable):
 
 ```
-spare = 100 − used − forecast of your own burn through the reset − reserve
+pooled spare = Σ(100 − used) − forecast of your own burn − reserve
 ```
+
+The reserve and the forecast are counted **once**, not once per account: you spend from one account at a time, so charging both to every account reserves capacity that was never at risk. This matters because the accounts' windows reset at different times — with one weekly window spent and another half free, a per-account view shows everything blocked while the pool still has room.
+
+Second, can a *single* account hold the job? A run cannot be split, so the job also has to fit in one account's remaining budget. The account with the most room wins, and `ccswap jobs capacity` shows both views plus when the next window refills.
 
 The forecast is the larger of your burn rate over the last hour and your typical burn for the remaining weekday/hour slots, learned from `cache/usage_history.jsonl` (seed it from an existing auto-switch log with `ccswap jobs backfill`). A job starts on the account with the most spare only when spare covers its estimate in every window it touches, **and** every interactive Claude Code session has been idle for `jobs.quietMinutes`. Jobs run pinned to their account through a session profile (`ccswap run` machinery), so an auto-switch of your default login never touches a running job. A job whose account is already the active login runs with the plain environment instead.
 
