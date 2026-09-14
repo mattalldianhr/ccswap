@@ -492,7 +492,15 @@ def _capacity(args, *, switcher, settings, store, runner, **_) -> int:
             )
             detail = []
             if w.recent_rate_pct_h is not None:
-                detail.append(f"recent {w.recent_rate_pct_h:.1f}%/h → {w.recent_forecast_pct:.0f}%")
+                # recent_forecast_pct is None when the window has no known
+                # reset (nothing used this cycle), so there is no horizon to
+                # extrapolate the rate over.
+                horizon = (
+                    f" → {w.recent_forecast_pct:.0f}%"
+                    if w.recent_forecast_pct is not None
+                    else " (no reset known)"
+                )
+                detail.append(f"recent {w.recent_rate_pct_h:.1f}%/h{horizon}")
             if w.typical_forecast_pct is not None:
                 detail.append(f"typical → {w.typical_forecast_pct:.0f}% ({w.samples} samples)")
             if detail:

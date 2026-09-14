@@ -252,6 +252,44 @@ class TestJobsScreen:
 
             assert isinstance(app.screen, JobsScreen)
 
+    async def test_live_mode_persists_across_screens(self, fake, tmp_path):
+        """Going live writes jobs.schedulerLive, so it survives leaving the screen."""
+        import json
+
+        from claude_swap.settings import settings_path
+
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _open(pilot)
+            assert app.screen._engine.dry_run is True
+            await pilot.press("l")
+            await pilot.pause()
+            await pilot.press("y")
+            await settle(pilot)
+            assert json.loads(settings_path(tmp_path).read_text())["jobs"]["schedulerLive"] is True
+            await pilot.press("escape")   # leave the screen
+            await pilot.pause()
+            await pilot.press("b")        # and come back
+            await settle(pilot)
+            await pilot.pause()
+            assert app.screen._engine.dry_run is False
+            assert app.screen.query_one("#jobs-badge", Static).has_class("live")
+
+    async def test_going_back_to_dry_run_persists_too(self, fake, tmp_path):
+        import json
+
+        from claude_swap.settings import set_setting, settings_path
+
+        set_setting(tmp_path, "jobs.schedulerLive", "true")
+        app = make_app(fake)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _open(pilot)
+            assert app.screen._engine.dry_run is False   # starts live from settings
+            await pilot.press("l")                        # live → dry-run needs no confirm
+            await settle(pilot)
+            assert app.screen._engine.dry_run is True
+            assert json.loads(settings_path(tmp_path).read_text())["jobs"]["schedulerLive"] is False
+
     async def test_go_live_needs_confirm(self, fake, tmp_path):
         app = make_app(fake)
         async with app.run_test(size=(120, 40)) as pilot:

@@ -92,6 +92,10 @@ class JobsSettings:
     default_model: str | None = None
     default_effort: str | None = None
     job_timeout_minutes: float = 120.0
+    # Whether the TUI's in-screen scheduler starts live rather than in
+    # dry-run. Persisted so going live survives leaving the Jobs screen;
+    # the launchd daemon is independent of this and always live.
+    scheduler_live: bool = False
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -219,6 +223,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "jobs", "jobTimeoutMinutes", "job_timeout_minutes", "float", 1.0, 1440.0,
             help="Kill a job that runs longer than this",
+        ),
+        SettingSpec(
+            "jobs", "schedulerLive", "scheduler_live", "bool",
+            help="Start the TUI's scheduler live instead of dry-run",
         ),
     )
 }

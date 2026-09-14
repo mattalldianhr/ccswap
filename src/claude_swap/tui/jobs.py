@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -373,7 +373,7 @@ class JobsScreen(Screen):
         self._runner = JobRunner(switcher, self._settings, self._store)
         self.query_one("#jobs-list", ListView).focus()
         self.watch(self.app, "theme", self._on_theme_change, init=False)
-        self._start_engine(dry_run=True)
+        self._start_engine(dry_run=not self._settings.scheduler_live)
         self.set_interval(REFRESH_S, self._refresh)
         self._refresh()
 
@@ -456,7 +456,22 @@ class JobsScreen(Screen):
     def _restart_engine(self, *, dry_run: bool) -> None:
         if self._engine is not None:
             self._engine.stop()
+        self._persist_live(not dry_run)
         self._start_engine(dry_run=dry_run)
+
+    def _persist_live(self, live: bool) -> None:
+        """Remember the choice, so it survives leaving the screen."""
+        from claude_swap.settings import set_setting
+
+        self._settings = replace(self._settings, scheduler_live=live)
+        try:
+            set_setting(
+                self.app.switcher_for("claude").backup_dir,
+                "jobs.schedulerLive",
+                "true" if live else "false",
+            )
+        except Exception as exc:  # noqa: BLE001 - persistence is best-effort
+            self.notify(f"Could not save scheduler mode: {exc}", severity="warning")
 
     def _update_badge(self) -> None:
         badge = self.query_one("#jobs-badge", Static)
@@ -614,9 +629,22 @@ class JobsScreen(Screen):
                 f" · quiet {min(idle, need * 60) / 60:.0f}/{need:.0f}m",
                 style=palette.sev_ok if quiet else palette.sev_warn,
             )
+        text.append(f" · daemon {self._daemon_state()}", style=palette.muted)
         if self._last_event is not None and self._last_event.kind in ("hold", "start", "error"):
             text.append(f" · {self._last_event.human()[:60]}", style=palette.muted)
         self.query_one("#jobs-summary", Static).update(text)
+
+    def _daemon_state(self) -> str:
+        """The launchd scheduler is independent of this screen's mode; say so,
+        since a DRY-RUN badge otherwise implies nothing can start."""
+        import sys
+
+        if sys.platform != "darwin":
+            return "n/a"
+        from claude_swap.jobs_cli import LAUNCHD_LABEL
+
+        plist = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
+        return "live" if plist.exists() else "off"
 
     def _update_capacity(self) -> None:
         width = (self.size.width or 100) - 4
