@@ -40,10 +40,38 @@ WINDOW_LABELS = {"five_hour": "5h", "weekly": "Weekly"}
 
 
 @dataclass(frozen=True)
-class AntigravityView:
+class AntigravityStatus:
+    """One reading, or the reason there isn't one.
+
+    Shared by the dashboard panel and the detail screen so both describe the
+    same failure in the same words, and so the panel never has to decide what
+    an exception from an undocumented endpoint means.
+    """
+
     usage: AntigravityUsage | None
     error: str | None
     taken_at: float
+
+    @classmethod
+    def read(cls, *, now: float | None = None) -> "AntigravityStatus":
+        """Read quota, converting every failure into an ``error`` string.
+
+        Deliberately non-raising: this runs on a worker thread feeding a
+        reactive that several widgets render. An exception escaping here would
+        blank a dashboard that is otherwise healthy.
+        """
+        now = now if now is not None else time.time()
+        try:
+            return cls(usage=read_usage(now=now), error=None, taken_at=now)
+        except AntigravityError as exc:
+            return cls(usage=None, error=str(exc), taken_at=now)
+        except Exception as exc:  # noqa: BLE001 - see the docstring
+            return cls(usage=None, error=f"{type(exc).__name__}: {exc}"[:200], taken_at=now)
+
+
+# The screen's own view is the same thing; kept as an alias so the screen and
+# the panel can never drift into two shapes.
+AntigravityView = AntigravityStatus
 
 
 def bar(pct: float, *, width: int = BAR_WIDTH) -> str:
@@ -145,15 +173,7 @@ class AntigravityScreen(Screen):
         endpoint on another tool's login: it going away must degrade this
         screen, never take down a TUI that is also showing healthy Claude data.
         """
-        now = time.time()
-        try:
-            view = AntigravityView(usage=read_usage(now=now), error=None, taken_at=now)
-        except AntigravityError as exc:
-            view = AntigravityView(usage=None, error=str(exc), taken_at=now)
-        except Exception as exc:  # noqa: BLE001 - a screen must not crash the app
-            view = AntigravityView(
-                usage=None, error=f"{type(exc).__name__}: {exc}"[:200], taken_at=now
-            )
+        view = AntigravityStatus.read()
         try:
             self.app.call_from_thread(self._apply, view)
         except Exception:
@@ -204,3 +224,64 @@ class AntigravityScreen(Screen):
             " Read-only. Separate from the managed Claude and Codex quotas.",
             style=palette.muted,
         ))
+
+
+def panel_text(
+    status: "AntigravityStatus | None", width: int, *, palette: Palette
+) -> Text:
+    """The compact dashboard form: one line per quota group.
+
+    ``Claude/GPT  5h ━━╸───  12% · 7d ────── 0%   serves Claude models``
+
+    Deliberately terser than the screen. On the dashboard this competes with
+    the accounts it sits beside, and the only question it has to answer at a
+    glance is whether there is room left in a budget the managed accounts do
+    not draw from. Press 'y' for the full reading.
+    """
+    from claude_swap.tui.widgets import bar_cells
+
+    text = Text(no_wrap=True, overflow="ellipsis")
+    if status is None:
+        text.append("loading…", style=palette.muted)
+        return text
+    if status.error is not None:
+        text.append(status.error, style=palette.sev_warn)
+        return text
+    usage = status.usage
+    if usage is None or not usage.groups:
+        text.append("no quota reported", style=palette.muted)
+        return text
+
+    # Bars shrink with the panel but never below a width where the fill is
+    # unreadable; the label column is fixed so the bars line up down the list.
+    bar_width = max(6, min(10, (width - 46) // 2))
+    for index, group in enumerate(usage.groups):
+        if index:
+            text.append("\n")
+        text.append(f"{_short_name(group.name):<11}", style=palette.foreground)
+        for position, name in enumerate(WINDOW_ORDER):
+            window = group.window(name)
+            if window is None:
+                continue
+            if position:
+                text.append(" · ", style=palette.muted)
+            text.append(f"{WINDOW_LABELS[name]} ", style=palette.muted)
+            text.append(bar_cells(window.used_pct, bar_width, palette=palette))
+            text.append(f" {window.used_pct:3.0f}%", style=palette.severity(window.used_pct))
+        if group.serves_claude:
+            text.append("   serves Claude", style=palette.accent)
+    return text
+
+
+def _short_name(name: str) -> str:
+    """Fit a group's name into the panel's label column.
+
+    Antigravity's own names ("Claude and GPT models") are written for a
+    settings page, not a status line.
+    """
+    lowered = name.lower()
+    if "claude" in lowered:
+        return "Claude/GPT"
+    if "gemini" in lowered:
+        return "Gemini"
+    return name[:11]

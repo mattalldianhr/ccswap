@@ -39,6 +39,12 @@ def _usage(payload=None, email="matt@example.com"):
     return parse_quota(payload or QUOTA_PAYLOAD, email=email, now=time.time())
 
 
+def _status(payload=None):
+    from claude_swap.tui.antigravity import AntigravityStatus
+
+    return AntigravityStatus(usage=_usage(payload), error=None, taken_at=time.time())
+
+
 async def _open(pilot):
     await settle(pilot)
     await pilot.press("y")
@@ -180,3 +186,129 @@ class TestMenuEntry:
 
         with patch.object(antigravity, "available", side_effect=RuntimeError("locked")):
             assert _antigravity_available() is False
+
+
+class TestPanelText:
+    """The compact dashboard form."""
+
+    def _palette(self):
+        from claude_swap.tui.theme import CSWAP_DARK, Palette
+
+        return Palette.from_theme(CSWAP_DARK)
+
+    def test_one_line_per_group_with_bars(self):
+        from claude_swap.tui.antigravity import panel_text
+
+        out = panel_text(_status(), 120, palette=self._palette()).plain
+        lines = out.splitlines()
+        assert len(lines) == 2
+        assert "5h" in lines[0] and "Weekly" in lines[0]
+        assert any(ch in out for ch in "━╸─")
+
+    def test_group_names_are_shortened_for_the_status_line(self):
+        """Antigravity's own names are written for a settings page."""
+        from claude_swap.tui.antigravity import panel_text
+
+        out = panel_text(_status(), 120, palette=self._palette()).plain
+        assert "Gemini" in out and "Claude/GPT" in out
+        assert "Claude and GPT models" not in out
+
+    def test_the_claude_group_is_flagged(self):
+        from claude_swap.tui.antigravity import panel_text
+
+        assert "serves Claude" in panel_text(_status(), 120, palette=self._palette()).plain
+
+    def test_utilization_not_remaining(self):
+        from claude_swap.tui.antigravity import panel_text
+
+        payload = {"groups": [{"displayName": "Gemini", "buckets": [
+            {"bucketId": "x", "window": "5h", "remainingFraction": 0.1}]}]}
+        out = panel_text(_status(payload), 120, palette=self._palette()).plain
+        assert "90%" in out
+
+    def test_loading_and_error_states_say_so(self):
+        from claude_swap.tui.antigravity import AntigravityStatus, panel_text
+
+        assert "loading" in panel_text(None, 120, palette=self._palette()).plain
+        broken = AntigravityStatus(usage=None, error="keychain locked", taken_at=0.0)
+        assert "keychain locked" in panel_text(broken, 120, palette=self._palette()).plain
+
+    def test_it_survives_a_narrow_panel(self):
+        from claude_swap.tui.antigravity import panel_text
+
+        for width in (40, 60, 80, 200):
+            out = panel_text(_status(), width, palette=self._palette()).plain
+            assert "Gemini" in out and len(out.splitlines()) == 2
+
+
+@pytest.mark.asyncio
+class TestDashboardPanel:
+    async def test_the_section_appears_in_the_combined_view(self, fake):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        app = make_app(fake)
+        with patch.object(screen_module, "read_usage", return_value=_usage()):
+            async with app.run_test(size=(130, 44)) as pilot:
+                app._antigravity_present = True
+                app.antigravity = screen_module.AntigravityStatus(
+                    usage=_usage(), error=None, taken_at=time.time())
+                await settle(pilot)
+                out = app.screen.query_one("#accounts-panel", AccountsPanel).render().plain
+        assert "Antigravity" in out and "Claude/GPT" in out
+        assert "Claude Code" in out  # still shows the managed accounts
+
+    async def test_hidden_without_a_login(self, fake):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        app = make_app(fake)
+        async with app.run_test(size=(130, 44)) as pilot:
+            app._antigravity_present = False
+            await settle(pilot)
+            out = app.screen.query_one("#accounts-panel", AccountsPanel).render().plain
+        assert "Antigravity" not in out
+
+    async def test_hidden_in_a_provider_scoped_view(self, fake):
+        """A provider view asked for one provider's accounts, not this."""
+        from claude_swap.tui.widgets import AccountsPanel
+
+        app = make_app(fake)
+        async with app.run_test(size=(130, 44)) as pilot:
+            app._antigravity_present = True
+            app.antigravity = screen_module.AntigravityStatus(
+                usage=_usage(), error=None, taken_at=time.time())
+            panel = AccountsPanel(provider="claude")
+            await app.screen.mount(panel)
+            await settle(pilot)
+            out = panel.render().plain
+        assert "Antigravity" not in out
+
+    async def test_a_failure_shows_on_the_panel_without_blanking_it(self, fake):
+        from claude_swap.tui.widgets import AccountsPanel
+
+        app = make_app(fake)
+        async with app.run_test(size=(130, 44)) as pilot:
+            app._antigravity_present = True
+            app.antigravity = screen_module.AntigravityStatus(
+                usage=None, error="endpoint moved", taken_at=time.time())
+            await settle(pilot)
+            out = app.screen.query_one("#accounts-panel", AccountsPanel).render().plain
+        assert "endpoint moved" in out
+        assert "Claude Code" in out  # healthy providers keep rendering
+
+
+class TestStatusReader:
+    def test_a_good_read_carries_the_usage(self):
+        from claude_swap.tui.antigravity import AntigravityStatus
+
+        with patch.object(screen_module, "read_usage", return_value=_usage()):
+            status = AntigravityStatus.read()
+        assert status.error is None and status.usage is not None
+
+    def test_every_failure_becomes_text_never_an_exception(self):
+        """It feeds a reactive several widgets render; an escape blanks them."""
+        from claude_swap.tui.antigravity import AntigravityStatus
+
+        for boom in (AntigravityError("no login"), RuntimeError("boom"), OSError("gone")):
+            with patch.object(screen_module, "read_usage", side_effect=boom):
+                status = AntigravityStatus.read()
+            assert status.usage is None and status.error

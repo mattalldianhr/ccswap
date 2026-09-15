@@ -67,6 +67,16 @@ class CswapApp(App):
     # file descriptors contend, recreating the lock-timeout/deadlock class the
     # app-level single-flight is meant to prevent.
     busy: reactive[bool] = reactive(False)
+    # Antigravity rides alongside rather than inside ``snapshots``: it is not
+    # a switchable provider (one login, read-only), so it has no accounts,
+    # no active slot, and none of the refresh lanes the others need. ``None``
+    # means "not read yet"; a failure lands as an ``AntigravityStatus`` whose
+    # ``error`` is set, so the panel can say so instead of rendering nothing.
+    antigravity: reactive[object | None] = reactive(None, always_update=True)
+
+    # Its windows move in hours and every read costs a request against an
+    # undocumented endpoint, so it polls far slower than the account lanes.
+    ANTIGRAVITY_POLL_S = 120.0
 
     def __init__(
         self,
@@ -103,6 +113,10 @@ class CswapApp(App):
         self._applied_generation = {provider: 0 for provider in PROVIDERS}
         self._last_refresh_error = {provider: "" for provider in PROVIDERS}
         self._last_auto_provider = "claude"
+        self._antigravity_refreshing = False
+        # Resolved once at mount: whether a login exists at all. No login means
+        # no section and no polling, which is the common case for other users.
+        self._antigravity_present = False
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -141,6 +155,7 @@ class CswapApp(App):
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
+        self._start_antigravity()
 
     # -- snapshot poll loop ---------------------------------------------------
 
@@ -551,6 +566,54 @@ class CswapApp(App):
         if isinstance(self.screen, CapacityScreen):
             return
         self.push_screen(CapacityScreen())
+
+    # -- antigravity ----------------------------------------------------------
+
+    def _start_antigravity(self) -> None:
+        """Begin polling Antigravity quota, if this machine has a login.
+
+        The presence check is attribute-only, so it never decrypts and never
+        prompts. Without a login nothing is scheduled at all: no section, no
+        requests, no error line for a provider the user does not use.
+        """
+        try:
+            from claude_swap.antigravity import available
+
+            self._antigravity_present = available()
+        except Exception:
+            self._antigravity_present = False
+        if not self._antigravity_present:
+            return
+        self.set_interval(self.ANTIGRAVITY_POLL_S, self._refresh_antigravity)
+        self._refresh_antigravity()
+
+    def _refresh_antigravity(self) -> None:
+        if self._antigravity_refreshing:
+            return
+        self._antigravity_refreshing = True
+        self.run_worker(
+            self._antigravity_blocking, thread=True, group="antigravity",
+            exit_on_error=False, name="antigravity",
+        )
+
+    def _antigravity_blocking(self) -> None:
+        """Keychain + network, off the UI thread.
+
+        Every failure becomes text on the panel. This reads an undocumented
+        endpoint through another tool's login: it breaking must never take
+        down a dashboard that is also showing healthy Claude and Codex data.
+        """
+        from claude_swap.tui.antigravity import AntigravityStatus
+
+        status = AntigravityStatus.read()
+        try:
+            self.call_from_thread(self._apply_antigravity, status)
+        except Exception:
+            pass  # the app went away mid-fetch
+
+    def _apply_antigravity(self, status: object) -> None:
+        self._antigravity_refreshing = False
+        self.antigravity = status
 
     # -- theme --------------------------------------------------------------
 

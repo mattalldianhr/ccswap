@@ -374,6 +374,7 @@ class AccountsPanel(Static):
     def on_mount(self) -> None:
         self.watch(self.app, "snapshots", lambda _snap: self.refresh(layout=True))
         self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+        self.watch(self.app, "antigravity", lambda _a: self.refresh(layout=True), init=False)
 
     def render(self) -> Text:
         app: "CswapApp" = self.app  # type: ignore[assignment]
@@ -434,6 +435,18 @@ class AccountsPanel(Static):
                 text.append(block)
                 previous_multiline = multiline
             rendered_sections += 1
+
+        # Antigravity last, and only in the combined view: it is not one of
+        # PROVIDERS (no accounts, nothing switchable), so a provider-scoped
+        # view has deliberately asked for one provider's accounts, not this.
+        if self.provider is None and getattr(app, "_antigravity_present", False):
+            from claude_swap.tui.antigravity import panel_text
+
+            if rendered_sections:
+                text.append("\n\n")
+            text.append(section_header_text("Antigravity", width, palette=palette))
+            text.append("\n")
+            text.append(panel_text(app.antigravity, width, palette=palette))
         return text
 
 
