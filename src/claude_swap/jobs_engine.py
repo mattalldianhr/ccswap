@@ -39,7 +39,7 @@ import random
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from claude_swap.capacity import (
@@ -373,10 +373,42 @@ class JobsEngine:
         except Exception:  # noqa: BLE001
             logger.debug("cycle recording failed", exc_info=True)
 
+    def learned_reserve(self):
+        """The weekly reserve to apply, learned from cycles where possible.
+
+        Returns a ``LearnedReserve`` whose ``pct`` is never above the
+        configured floor: learning may hand jobs *less* capacity than
+        configured, never more.
+        """
+        from claude_swap.learned import LearnedReserve, learn_reserve
+
+        floor = self.settings.weekly_reserve_pct
+        if not getattr(self.settings, "learn_reserve", True):
+            return LearnedReserve(pct=floor, cycles=0, own_demand_pct=None,
+                                  floor_pct=floor, reason="learning disabled")
+        try:
+            from claude_swap.cycles import CycleStore
+
+            store = CycleStore(self.switcher.backup_dir / "cache")
+            return learn_reserve(store.complete_cycles(), floor, jobs=self.store.all())
+        except Exception:  # noqa: BLE001 - never let this break a tick
+            logger.debug("learned reserve failed", exc_info=True)
+            return LearnedReserve(pct=floor, cycles=0, own_demand_pct=None,
+                                  floor_pct=floor, reason="unavailable")
+
     def capacities(self, *, now: float | None = None) -> list[AccountCapacity]:
         """Store-only capacity for every enabled OAuth account."""
         now = self.clock() if now is None else now
         entries = self.switcher.usage_entries_by_account(fetch=set())
+        # Apply the learned weekly reserve, if there is one, by handing the
+        # capacity builder a settings object with that floor.
+        learned = self.learned_reserve()
+        self._last_learned_reserve = learned
+        effective_settings = (
+            replace(self.settings, weekly_reserve_pct=learned.pct)
+            if learned.pct != self.settings.weekly_reserve_pct
+            else self.settings
+        )
         data = self.switcher._get_sequence_data() or {}
         accounts = data.get("accounts", {})
         out: list[AccountCapacity] = []
@@ -390,7 +422,7 @@ class JobsEngine:
             cap = account_capacity(
                 number=num, email=email, entry=entry, now=now,
                 history=self.switcher._usage_store.history,
-                settings=self.settings, reserves=self.reserves,
+                settings=effective_settings, reserves=self.reserves,
             )
             if entry is not None and entry.age_s is not None and entry.age_s > USAGE_TRUST_S:
                 cap = AccountCapacity(

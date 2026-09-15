@@ -521,6 +521,12 @@ def _capacity(args, *, switcher, settings, store, runner, **_) -> int:
                 detail.append(f"typical → {w.typical_forecast_pct:.0f}% ({w.samples} samples)")
             if detail:
                 print(dimmed("           " + " · ".join(detail)))
+    learned = engine.learned_reserve()
+    print(f"{bolded('Weekly reserve')}: {learned.describe()}"
+          + (dimmed(f"  own demand {learned.own_demand_pct:.0f}% at the 80th pct"
+                    f", floor {learned.floor_pct:.0f}%")
+             if learned.learned else ""))
+
     pool = pooled_capacity(caps)
     if pool:
         print(f"\n{bolded('Pooled')} (reserve and forecast counted once across accounts)")

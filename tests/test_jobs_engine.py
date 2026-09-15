@@ -385,3 +385,52 @@ class TestCycleRecording:
         finally:
             p.stop()
         assert len(caps) == 2
+
+
+class TestLearnedReserveApplied:
+    def test_floor_used_until_enough_cycles(self, harness, tmp_path):
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        try:
+            learned = engine.learned_reserve()
+        finally:
+            p.stop()
+        assert learned.pct == engine.settings.weekly_reserve_pct
+        assert learned.learned is False
+
+    def test_learned_value_lowers_the_reserve(self, harness, tmp_path):
+        from claude_swap.learned import MIN_CYCLES, LearnedReserve
+
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        low = LearnedReserve(pct=3.0, cycles=MIN_CYCLES, own_demand_pct=92.0,
+                             floor_pct=10.0, reason="learned")
+        try:
+            with patch.object(engine, "learned_reserve", return_value=low):
+                caps = engine.capacities(now=NOW)
+        finally:
+            p.stop()
+        assert caps[0].window("7d").reserve_pct == 3.0
+
+    def test_disabled_by_setting(self, harness, tmp_path):
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(
+            harness, tmp_path, entries=entries,
+            settings=JobsSettings(quiet_minutes=0, learn_reserve=False))
+        try:
+            learned = engine.learned_reserve()
+        finally:
+            p.stop()
+        assert learned.reason == "learning disabled"
+        assert learned.pct == engine.settings.weekly_reserve_pct
+
+    def test_failure_falls_back_to_the_floor(self, harness, tmp_path):
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        try:
+            with patch("claude_swap.cycles.CycleStore", side_effect=RuntimeError("boom")):
+                learned = engine.learned_reserve()
+        finally:
+            p.stop()
+        assert learned.reason == "unavailable"
+        assert learned.pct == engine.settings.weekly_reserve_pct

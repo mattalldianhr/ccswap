@@ -96,6 +96,10 @@ class JobsSettings:
     # dry-run. Persisted so going live survives leaving the Jobs screen;
     # the launchd daemon is independent of this and always live.
     scheduler_live: bool = False
+    # Derive the weekly reserve from recorded cycles once there are enough of
+    # them (learned.py). It can only ever hold back *less* than the configured
+    # floor, never more, so this is safe to leave on.
+    learn_reserve: bool = True
 
 
 _SECTION_DEFAULT_SOURCES = {
@@ -227,6 +231,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "jobs", "schedulerLive", "scheduler_live", "bool",
             help="Start the TUI's scheduler live instead of dry-run",
+        ),
+        SettingSpec(
+            "jobs", "learnReserve", "learn_reserve", "bool",
+            help="Learn the weekly reserve from recorded usage cycles",
         ),
     )
 }
