@@ -663,6 +663,59 @@ def _codex_command(argv: list[str]) -> None:
         sys.exit(1)
 
 
+def _antigravity_command(argv: list[str]) -> None:
+    """Handle ``cswap antigravity`` — read-only quota for the Antigravity CLI.
+
+    Antigravity is not a switchable provider: it holds one login and ccswap
+    only reads it. There is no add/switch/remove, and nothing is written back.
+    """
+    from claude_swap.antigravity import AntigravityError, read_usage
+    from claude_swap.oauth import format_reset
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} antigravity",
+        description=(
+            "Show Antigravity (Gemini Code Assist) quota. Sign in with 'agy' first. "
+            "Quota is read-only here; ccswap never modifies the Antigravity login."
+        ),
+    )
+    subcommands = parser.add_subparsers(dest="action", required=False)
+    usage = subcommands.add_parser("usage", help="Show Antigravity quota windows")
+    usage.add_argument("--json", action="store_true")
+    parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+
+    try:
+        reading = read_usage()
+    except AntigravityError as exc:
+        if args.json:
+            print(json.dumps(error_envelope(str(exc)), indent=2))
+        else:
+            error(f"Error: {exc}")
+        sys.exit(1)
+
+    payload = {"provider": "antigravity", **reading.to_json()}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(f"Antigravity: {reading.email or 'signed in'}")
+    for group in reading.groups:
+        tag = accent("  [serves Claude models]") if group.serves_claude else ""
+        print(f"{bolded(group.name)}{tag}")
+        if group.description:
+            print(f"  {dimmed(group.description)}")
+        for key, label in (("five_hour", "5h"), ("weekly", "Weekly")):
+            window = group.window(key)
+            if window is None:
+                continue
+            line = f"  {label}: {window.used_pct:.0f}% used"
+            if window.resets_at:
+                countdown, clock = format_reset(window.resets_at)
+                line += f" \u00b7 resets in {countdown} ({clock})"
+            print(line)
+
+
 def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | None:
     """Run ``list`` across providers, honoring ``--provider`` and ``--json``.
 
@@ -1070,6 +1123,9 @@ def main() -> None:
     if argv and argv[0] == "codex":
         _codex_command(argv[1:])
         return
+    if argv and argv[0] == "antigravity":
+        _antigravity_command(argv[1:])
+        return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
         return  # only reachable in tests where sys.exit is mocked
@@ -1143,6 +1199,7 @@ Commands:
   %(prog)s swap <a> <b>               exchange two accounts' slot numbers
   %(prog)s move <a> <slot>            assign an account to a slot (swaps if taken)
   %(prog)s codex <command>            manage Codex CLI accounts
+  %(prog)s antigravity usage          show Antigravity (Gemini) quota
   %(prog)s auto                       auto-switch when nearing rate limits
   %(prog)s config [set KEY VALUE]     show or change settings (settings.json)
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries

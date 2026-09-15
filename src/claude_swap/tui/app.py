@@ -538,6 +538,13 @@ class CswapApp(App):
             return
         self.push_screen(ReservesScreen())
 
+    def action_open_antigravity(self) -> None:
+        from claude_swap.tui.antigravity import AntigravityScreen
+
+        if isinstance(self.screen, AntigravityScreen):
+            return
+        self.push_screen(AntigravityScreen())
+
     def action_open_capacity(self) -> None:
         from claude_swap.tui.capacity import CapacityScreen
 

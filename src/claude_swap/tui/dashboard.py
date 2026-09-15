@@ -28,6 +28,20 @@ from textual.widgets import Footer, ListView, Static
 
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.tui.data import PROVIDERS, PROVIDER_LABELS, iter_accounts
+
+
+def _antigravity_available() -> bool:
+    """Whether to offer the Antigravity screen at all.
+
+    Import-local and non-raising: an unusable Keychain must hide the entry,
+    never break the menu that also lists every working action.
+    """
+    try:
+        from claude_swap.antigravity import available
+
+        return available()
+    except Exception:  # noqa: BLE001 - a cosmetic menu entry is never worth a crash
+        return False
 from claude_swap.tui.widgets import (
     AccountItem,
     AccountsPanel,
@@ -57,6 +71,7 @@ class DashboardScreen(Screen):
         # Power shortcuts; the menu is the discoverable path.
         Binding("g", "app.open_auto", "Auto view", show=False),
         Binding("b", "app.open_jobs", "Jobs", show=False),
+        Binding("y", "app.open_antigravity", "Antigravity", show=False),
         Binding("f", "app.refresh_full", "Refresh usage", show=False),
         Binding("j", "cursor_down", show=False),
         Binding("k", "cursor_up", show=False),
@@ -94,6 +109,14 @@ class DashboardScreen(Screen):
             ("Auto-switch view…", "auto"),
             ("Jobs…", "jobs"),
             ("Reserves…", "reserves"),
+            *(
+                # Only when a login exists: an entry leading to "no Antigravity
+                # login" is noise for the many users who have none. The check is
+                # attribute-only, so it never decrypts and never prompts.
+                [("Antigravity quota…", "antigravity")]
+                if _antigravity_available()
+                else []
+            ),
             ("Add account…", "add-menu"),
             ("Disable / enable account…", "disable-menu"),
             ("Remove account…", "remove-menu"),
@@ -254,6 +277,7 @@ class DashboardScreen(Screen):
             "watch": app.action_open_watch,
             "jobs": app.action_open_jobs,
             "reserves": app.action_open_reserves,
+            "antigravity": app.action_open_antigravity,
             "add-token": app.action_add_token,
             "quit": app.exit,
         }
