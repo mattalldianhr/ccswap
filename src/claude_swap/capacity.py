@@ -190,6 +190,35 @@ def typical_forecast(
     return total, used
 
 
+def blend_forecast(
+    recent_pct: float | None,
+    typical_pct: float | None,
+    *,
+    observed_s: float,
+    full_confidence_s: float = RECENT_WINDOW_S,
+) -> float:
+    """Combine the two forecasts, weighted by how much evidence the recent
+    rate actually has.
+
+    Taking ``max`` let one busy hour dominate: ten minutes into a cycle, a
+    heavy burst projected across the remaining time produced a near-certain
+    "you will use it all" from almost no evidence. Taking ``min`` would be
+    worse — measured over 36 of Matt's 5h cycles the median peak is 82% and
+    half exceed 80%, so the pessimistic view is usually right *eventually*.
+
+    So weight the recent rate by the fraction of ``full_confidence_s`` it has
+    been observed over, and fall back to the typical profile for the rest.
+    With a full hour of evidence the recent rate stands alone; with six
+    minutes it contributes a tenth.
+    """
+    if recent_pct is None:
+        return typical_pct or 0.0
+    if typical_pct is None:
+        return recent_pct
+    weight = max(0.0, min(1.0, observed_s / full_confidence_s)) if full_confidence_s > 0 else 1.0
+    return weight * recent_pct + (1.0 - weight) * typical_pct
+
+
 def _reset_ts(value: str | None) -> float | None:
     if not isinstance(value, str):
         return None
@@ -218,6 +247,9 @@ def window_capacity(
         remaining_s = max(0.0, reset_ts - now)
         if remaining_s > period:
             remaining_s = period
+    # How far into this cycle we are: the recent rate is only as trustworthy
+    # as the span it was measured over.
+    elapsed_s = None if remaining_s is None else max(0.0, period - remaining_s)
     series = _window_series(samples, window)
     rate = recent_rate(series, now=now)
     recent_fc = None
@@ -233,8 +265,9 @@ def window_capacity(
         typical_fc, n = typical_forecast(
             profile, now=now, remaining_s=remaining_s, default_pct_h=default_rate
         )
-    candidates = [v for v in (recent_fc, typical_fc) if v is not None]
-    forecast = max(candidates) if candidates else 0.0
+    forecast = blend_forecast(
+        recent_fc, typical_fc, observed_s=min(RECENT_WINDOW_S, elapsed_s or 0.0)
+    )
     if used_pct is not None:
         forecast = min(forecast, max(0.0, 100.0 - used_pct))
 

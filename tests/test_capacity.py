@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from claude_swap.capacity import (
     account_capacity,
     hourly_profile,
@@ -139,3 +141,40 @@ class TestAccountCapacity:
         assert windows_for_job(None, avail) == ("5h", "7d")
         assert windows_for_job("claude-fable-5-1", avail) == ("5h", "7d", "Fable")
         assert windows_for_job("opus", avail) == ("5h", "7d")
+
+
+class TestBlendForecast:
+    """The recent rate is weighted by the evidence behind it."""
+
+    def test_full_hour_of_evidence_trusts_the_recent_rate(self):
+        from claude_swap.capacity import RECENT_WINDOW_S, blend_forecast
+
+        assert blend_forecast(80.0, 20.0, observed_s=RECENT_WINDOW_S) == 80.0
+
+    def test_early_in_the_cycle_leans_on_the_typical_profile(self):
+        from claude_swap.capacity import blend_forecast
+
+        # six minutes of evidence → a tenth of the weight
+        assert blend_forecast(80.0, 20.0, observed_s=360.0) == pytest.approx(26.0)
+
+    def test_half_way(self):
+        from claude_swap.capacity import blend_forecast
+
+        assert blend_forecast(80.0, 20.0, observed_s=1800.0) == pytest.approx(50.0)
+
+    def test_missing_inputs(self):
+        from claude_swap.capacity import blend_forecast
+
+        assert blend_forecast(None, 20.0, observed_s=0.0) == 20.0
+        assert blend_forecast(80.0, None, observed_s=0.0) == 80.0
+        assert blend_forecast(None, None, observed_s=0.0) == 0.0
+
+    def test_burst_at_cycle_start_no_longer_dominates(self):
+        """The 2026-09-15 case: 15% used, a hot first minutes, 4h left."""
+        from claude_swap.capacity import blend_forecast
+
+        # recent rate says 85 over the rest; the profile says 30
+        early = blend_forecast(85.0, 30.0, observed_s=300.0)
+        assert early < 40.0          # was 85 under max()
+        late = blend_forecast(85.0, 30.0, observed_s=3600.0)
+        assert late == 85.0          # with real evidence, still believed
