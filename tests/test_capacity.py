@@ -64,7 +64,8 @@ class TestWindowCapacity:
         settings = JobsSettings(reserve_pct=15.0)
         reserves = ReserveStore(tmp_path)
         reserves.add(Reserve(id="r", window="5h", pct=30))
-        # steady 5 pct/h over the last hour, 2h left → forecast 10
+        # steady 5 pct/h over the last hour. The 5h window is a throttle, so
+        # only THROTTLE_HORIZON_S is projected, not the full 2h remaining.
         samples = [_s(NOW - 3600, 40.0), _s(NOW - 1800, 42.5), _s(NOW, 45.0)]
         cap = window_capacity(
             window="5h", used_pct=45.0, resets_at=_iso(NOW + 7200), now=NOW,
@@ -73,7 +74,9 @@ class TestWindowCapacity:
         )
         assert cap.recent_rate_pct_h == 5.0
         assert cap.reserve_pct == 30.0 and cap.reserve_source.id == "r"
-        assert cap.forecast_pct >= 10.0
+        from claude_swap.capacity import THROTTLE_HORIZON_S
+
+        assert cap.recent_forecast_pct == pytest.approx(5.0 * THROTTLE_HORIZON_S / 3600.0)
         assert cap.spare_pct == 100 - 45 - cap.forecast_pct - 30
         assert cap.fits(cap.spare_pct) and not cap.fits(cap.spare_pct + 1)
 
@@ -178,3 +181,86 @@ class TestBlendForecast:
         assert early < 40.0          # was 85 under max()
         late = blend_forecast(85.0, 30.0, observed_s=3600.0)
         assert late == 85.0          # with real evidence, still believed
+
+
+class TestPacedReserve:
+    """Weekly budget is use-it-or-lose-it; the reserve relaxes near reset."""
+
+    def test_full_reserve_early_in_the_cycle(self):
+        from claude_swap.capacity import paced_reserve
+
+        week = 7 * 86400
+        assert paced_reserve(10.0, elapsed_s=0, period_s=week) == 10.0
+        assert paced_reserve(10.0, elapsed_s=2 * 86400, period_s=week) == 10.0
+        assert paced_reserve(10.0, elapsed_s=3.5 * 86400, period_s=week) == 10.0
+
+    def test_releases_linearly_over_the_second_half(self):
+        from claude_swap.capacity import paced_reserve
+
+        week = 7 * 86400
+        assert paced_reserve(10.0, elapsed_s=5.25 * 86400, period_s=week) == pytest.approx(5.0)
+        assert paced_reserve(10.0, elapsed_s=6.3 * 86400, period_s=week) == pytest.approx(2.0)
+
+    def test_zero_at_reset(self):
+        from claude_swap.capacity import paced_reserve
+
+        week = 7 * 86400
+        assert paced_reserve(10.0, elapsed_s=week, period_s=week) == 0.0
+        assert paced_reserve(10.0, elapsed_s=week * 2, period_s=week) == 0.0
+
+    def test_unknown_elapsed_keeps_the_floor(self):
+        from claude_swap.capacity import paced_reserve
+
+        assert paced_reserve(10.0, elapsed_s=None, period_s=7 * 86400) == 10.0
+        assert paced_reserve(10.0, elapsed_s=100, period_s=0) == 10.0
+
+    def test_release_fraction_is_tunable(self):
+        from claude_swap.capacity import paced_reserve
+
+        week = 7 * 86400
+        # release over only the last quarter
+        assert paced_reserve(10.0, elapsed_s=5 * 86400, period_s=week, release_fraction=0.25) == 10.0
+        assert paced_reserve(10.0, elapsed_s=6.125 * 86400, period_s=week,
+                             release_fraction=0.25) == pytest.approx(5.0)
+
+
+class TestThrottleHorizon:
+    """The 5h window forecasts only the next stretch, not its whole span."""
+
+    def test_5h_forecast_is_capped_to_the_throttle_horizon(self):
+        from claude_swap.capacity import THROTTLE_HORIZON_S
+
+        # 20%/h burn with 4h left: the full-span view predicts 80 points.
+        samples = [_s(NOW - 3600, 30.0), _s(NOW - 1800, 40.0), _s(NOW, 50.0)]
+        cap = window_capacity(
+            window="5h", used_pct=50.0, resets_at=_iso(NOW + 4 * 3600), now=NOW,
+            samples=samples, settings=JobsSettings(), reserves=None, email=None, floor_pct=15.0,
+        )
+        assert cap.recent_rate_pct_h == pytest.approx(20.0)
+        # Only the throttle horizon is projected.
+        assert cap.recent_forecast_pct == pytest.approx(20.0 * THROTTLE_HORIZON_S / 3600.0)
+        assert cap.forecast_pct < 20.0
+
+    def test_weekly_window_still_forecasts_its_full_span(self):
+        samples = [_s(NOW - 3600, 10.0, 20.0), _s(NOW, 10.0, 22.0)]
+        cap = window_capacity(
+            window="7d", used_pct=22.0, resets_at=_iso(NOW + 48 * 3600), now=NOW,
+            samples=samples, settings=JobsSettings(), reserves=None, email=None, floor_pct=10.0,
+        )
+        # 2%/h over 48h is a big number — the weekly window is a budget.
+        assert cap.recent_forecast_pct is not None and cap.recent_forecast_pct > 50.0
+
+    def test_5h_reserve_is_not_paced(self):
+        """Only the weekly budget expires; the throttle's floor is constant."""
+        cap = window_capacity(
+            window="5h", used_pct=10.0, resets_at=_iso(NOW + 60), now=NOW,
+            samples=[], settings=JobsSettings(), reserves=None, email=None, floor_pct=15.0,
+        )
+        assert cap.reserve_pct == 15.0
+
+    def test_weekly_reserve_is_paced_near_reset(self):
+        cap = window_capacity(
+            window="7d", used_pct=50.0, resets_at=_iso(NOW + 3600), now=NOW,
+            samples=[], settings=JobsSettings(), reserves=None, email=None, floor_pct=10.0,
+        )
+        assert cap.reserve_pct < 1.0   # an hour from reset

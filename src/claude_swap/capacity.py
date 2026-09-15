@@ -41,6 +41,14 @@ from claude_swap.settings import JobsSettings
 from claude_swap.usage_history import Sample, UsageHistory
 
 FIVE_HOUR_PERIOD_S = 5 * 3600.0
+# The 5h window is a THROTTLE, not a budget. It refills 33 times before the
+# weekly window does, so nothing is conserved by leaving it unused — its only
+# job is to keep a job from colliding with the user right now. Forecasting it
+# across its whole remaining span (as the weekly window deserves) made its
+# spare swing negative whenever Matt was working, and since a job must clear
+# both windows, that shrank the startable moments to the intersection of
+# "quiet" and "early in the week".
+THROTTLE_HORIZON_S = 45 * 60.0
 RECENT_WINDOW_S = 3600.0  # burn-rate lookback for the "right now" view
 MIN_RECENT_SPAN_S = 600.0  # need at least this much span to trust a rate
 # Hours of a window with no history at all assume this pct/h of own burn —
@@ -190,6 +198,33 @@ def typical_forecast(
     return total, used
 
 
+def paced_reserve(
+    floor_pct: float,
+    *,
+    elapsed_s: float | None,
+    period_s: float,
+    release_fraction: float = 0.5,
+) -> float:
+    """The weekly reserve, relaxed as the window's reset approaches.
+
+    Weekly budget is use-it-or-lose-it: whatever is unspent at reset is
+    capacity paid for and thrown away. A reserve that stays constant all week
+    is therefore most wrong at the end, when there is no "later" left to
+    protect. This scales the floor down linearly over the last
+    ``release_fraction`` of the cycle, reaching zero at the reset.
+
+    Early in the week the full floor applies — that is when protecting
+    headroom actually means something.
+    """
+    if elapsed_s is None or period_s <= 0:
+        return floor_pct
+    progress = max(0.0, min(1.0, elapsed_s / period_s))
+    if progress <= (1.0 - release_fraction):
+        return floor_pct
+    remaining_fraction = (1.0 - progress) / release_fraction
+    return floor_pct * max(0.0, remaining_fraction)
+
+
 def blend_forecast(
     recent_pct: float | None,
     typical_pct: float | None,
@@ -250,11 +285,15 @@ def window_capacity(
     # How far into this cycle we are: the recent rate is only as trustworthy
     # as the span it was measured over.
     elapsed_s = None if remaining_s is None else max(0.0, period - remaining_s)
+    # A throttle only needs to know the next stretch, not the whole window.
+    horizon_s = remaining_s
+    if window == WINDOW_5H and remaining_s is not None:
+        horizon_s = min(remaining_s, THROTTLE_HORIZON_S)
     series = _window_series(samples, window)
     rate = recent_rate(series, now=now)
     recent_fc = None
-    if rate is not None and remaining_s is not None:
-        recent_fc = rate * (remaining_s / 3600.0)
+    if rate is not None and horizon_s is not None:
+        recent_fc = rate * (horizon_s / 3600.0)
     typical_fc: float | None = None
     n = 0
     if remaining_s is not None:
@@ -263,7 +302,7 @@ def window_capacity(
         )
         default_rate = DEFAULT_TYPICAL_PCT_PER_H.get(window, DEFAULT_TYPICAL_PCT_PER_H[WINDOW_7D])
         typical_fc, n = typical_forecast(
-            profile, now=now, remaining_s=remaining_s, default_pct_h=default_rate
+            profile, now=now, remaining_s=horizon_s, default_pct_h=default_rate
         )
     forecast = blend_forecast(
         recent_fc, typical_fc, observed_s=min(RECENT_WINDOW_S, elapsed_s or 0.0)
@@ -271,10 +310,13 @@ def window_capacity(
     if used_pct is not None:
         forecast = min(forecast, max(0.0, 100.0 - used_pct))
 
+    floor = floor_pct
+    if window != WINDOW_5H:
+        floor = paced_reserve(floor_pct, elapsed_s=elapsed_s, period_s=period)
     if reserves is not None:
-        reserve, source = reserves.effective(window, now=now, email=email, floor=floor_pct)
+        reserve, source = reserves.effective(window, now=now, email=email, floor=floor)
     else:
-        reserve, source = floor_pct, None
+        reserve, source = floor, None
 
     spare: float | None = None
     if used_pct is not None:
