@@ -361,6 +361,18 @@ class JobsEngine:
 
         return get_default_claude_config_home()
 
+    def _record_cycles(self, emails: list[str]) -> None:
+        """Note any newly-completed usage cycle. Best-effort and off the hot
+        path: the scheduler does not read these yet, they accumulate so the
+        reserve/forecast shape can later be measured instead of guessed."""
+        try:
+            from claude_swap.cycles import CycleStore, update_from_history
+
+            store = CycleStore(self.switcher.backup_dir / "cache")
+            update_from_history(self.switcher._usage_store.history, store, emails)
+        except Exception:  # noqa: BLE001
+            logger.debug("cycle recording failed", exc_info=True)
+
     def capacities(self, *, now: float | None = None) -> list[AccountCapacity]:
         """Store-only capacity for every enabled OAuth account."""
         now = self.clock() if now is None else now
@@ -387,6 +399,7 @@ class JobsEngine:
                     usage_error=cap.usage_error or f"usage {entry.age_s / 60:.0f}m old",
                 )
             out.append(cap)
+        self._record_cycles([cap.email for cap in out if cap.email])
         return out
 
     def idle(self, *, now: float | None = None) -> IdleReport:

@@ -198,31 +198,13 @@ def typical_forecast(
     return total, used
 
 
-def paced_reserve(
-    floor_pct: float,
-    *,
-    elapsed_s: float | None,
-    period_s: float,
-    release_fraction: float = 0.5,
-) -> float:
-    """The weekly reserve, relaxed as the window's reset approaches.
-
-    Weekly budget is use-it-or-lose-it: whatever is unspent at reset is
-    capacity paid for and thrown away. A reserve that stays constant all week
-    is therefore most wrong at the end, when there is no "later" left to
-    protect. This scales the floor down linearly over the last
-    ``release_fraction`` of the cycle, reaching zero at the reset.
-
-    Early in the week the full floor applies — that is when protecting
-    headroom actually means something.
-    """
-    if elapsed_s is None or period_s <= 0:
-        return floor_pct
-    progress = max(0.0, min(1.0, elapsed_s / period_s))
-    if progress <= (1.0 - release_fraction):
-        return floor_pct
-    remaining_fraction = (1.0 - progress) / release_fraction
-    return floor_pct * max(0.0, remaining_fraction)
+# NOTE (2026-09-15): a `paced_reserve` that relaxed the weekly floor toward
+# reset was built and then removed. The idea is sound — unspent weekly budget
+# is waste — but it cannot be calibrated yet: the history holds four complete
+# cycles, and an analysis that seemed to show front-loading turned out to be an
+# artifact of averaging two accounts whose resets are 16h apart onto one
+# elapsed axis. `cycles.py` now records each completed cycle so the shape can
+# come from measurement rather than a guess.
 
 
 def blend_forecast(
@@ -310,13 +292,10 @@ def window_capacity(
     if used_pct is not None:
         forecast = min(forecast, max(0.0, 100.0 - used_pct))
 
-    floor = floor_pct
-    if window != WINDOW_5H:
-        floor = paced_reserve(floor_pct, elapsed_s=elapsed_s, period_s=period)
     if reserves is not None:
-        reserve, source = reserves.effective(window, now=now, email=email, floor=floor)
+        reserve, source = reserves.effective(window, now=now, email=email, floor=floor_pct)
     else:
-        reserve, source = floor, None
+        reserve, source = floor_pct, None
 
     spare: float | None = None
     if used_pct is not None:

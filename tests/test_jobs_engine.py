@@ -362,3 +362,26 @@ class TestStaleBusyRecords:
             assert engine.tick() is TickOutcome.STARTED
         finally:
             p.stop()
+
+
+class TestCycleRecording:
+    def test_capacities_records_completed_cycles(self, harness, tmp_path):
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        try:
+            with patch("claude_swap.cycles.update_from_history", return_value=1) as rec:
+                engine.capacities(now=NOW)
+        finally:
+            p.stop()
+        rec.assert_called_once()
+        assert set(rec.call_args.args[2]) == {"a@example.com", "b@example.com"}
+
+    def test_recording_failure_never_breaks_a_tick(self, harness, tmp_path):
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 50, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        try:
+            with patch("claude_swap.cycles.update_from_history", side_effect=RuntimeError("disk full")):
+                caps = engine.capacities(now=NOW)
+        finally:
+            p.stop()
+        assert len(caps) == 2

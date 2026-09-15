@@ -183,47 +183,6 @@ class TestBlendForecast:
         assert late == 85.0          # with real evidence, still believed
 
 
-class TestPacedReserve:
-    """Weekly budget is use-it-or-lose-it; the reserve relaxes near reset."""
-
-    def test_full_reserve_early_in_the_cycle(self):
-        from claude_swap.capacity import paced_reserve
-
-        week = 7 * 86400
-        assert paced_reserve(10.0, elapsed_s=0, period_s=week) == 10.0
-        assert paced_reserve(10.0, elapsed_s=2 * 86400, period_s=week) == 10.0
-        assert paced_reserve(10.0, elapsed_s=3.5 * 86400, period_s=week) == 10.0
-
-    def test_releases_linearly_over_the_second_half(self):
-        from claude_swap.capacity import paced_reserve
-
-        week = 7 * 86400
-        assert paced_reserve(10.0, elapsed_s=5.25 * 86400, period_s=week) == pytest.approx(5.0)
-        assert paced_reserve(10.0, elapsed_s=6.3 * 86400, period_s=week) == pytest.approx(2.0)
-
-    def test_zero_at_reset(self):
-        from claude_swap.capacity import paced_reserve
-
-        week = 7 * 86400
-        assert paced_reserve(10.0, elapsed_s=week, period_s=week) == 0.0
-        assert paced_reserve(10.0, elapsed_s=week * 2, period_s=week) == 0.0
-
-    def test_unknown_elapsed_keeps_the_floor(self):
-        from claude_swap.capacity import paced_reserve
-
-        assert paced_reserve(10.0, elapsed_s=None, period_s=7 * 86400) == 10.0
-        assert paced_reserve(10.0, elapsed_s=100, period_s=0) == 10.0
-
-    def test_release_fraction_is_tunable(self):
-        from claude_swap.capacity import paced_reserve
-
-        week = 7 * 86400
-        # release over only the last quarter
-        assert paced_reserve(10.0, elapsed_s=5 * 86400, period_s=week, release_fraction=0.25) == 10.0
-        assert paced_reserve(10.0, elapsed_s=6.125 * 86400, period_s=week,
-                             release_fraction=0.25) == pytest.approx(5.0)
-
-
 class TestThrottleHorizon:
     """The 5h window forecasts only the next stretch, not its whole span."""
 
@@ -258,9 +217,10 @@ class TestThrottleHorizon:
         )
         assert cap.reserve_pct == 15.0
 
-    def test_weekly_reserve_is_paced_near_reset(self):
+    def test_weekly_reserve_is_the_flat_floor(self):
+        """Pacing was removed until the cycle log can calibrate it."""
         cap = window_capacity(
             window="7d", used_pct=50.0, resets_at=_iso(NOW + 3600), now=NOW,
             samples=[], settings=JobsSettings(), reserves=None, email=None, floor_pct=10.0,
         )
-        assert cap.reserve_pct < 1.0   # an hour from reset
+        assert cap.reserve_pct == 10.0
