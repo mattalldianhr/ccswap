@@ -21,6 +21,7 @@ from claude_swap import antigravity
 from claude_swap.antigravity import (
     GO_KEYRING_PREFIX,
     AntigravityError,
+    REFRESH_HINT,
     account_email,
     available,
     decode_credential,
@@ -29,7 +30,6 @@ from claude_swap.antigravity import (
     project_id,
     read_credential,
     read_usage,
-    refresh_credential,
     token_expired,
     token_expiry,
 )
@@ -202,70 +202,6 @@ class TestTokenExpiry:
         assert token_expired(_credential(), now=NOW) is False
 
 
-class TestRefresh:
-    def _ok(self, **extra):
-        return _Response({"access_token": "fresh", "expires_in": 3600, **extra})
-
-    def test_mints_a_new_access_token(self):
-        with patch.object(antigravity.urllib.request, "urlopen", return_value=self._ok()):
-            refreshed = refresh_credential(_credential(expiry=NOW))
-        assert refreshed["token"]["access_token"] == "fresh"
-        assert refreshed["token"]["refresh_token"] == "refresh-abc"
-
-    def test_does_not_mutate_the_callers_document(self):
-        original = _credential(expiry=NOW)
-        with patch.object(antigravity.urllib.request, "urlopen", return_value=self._ok()):
-            refresh_credential(original)
-        assert original["token"]["access_token"] == "access-xyz"
-
-    def test_a_rotated_refresh_token_is_kept(self):
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          return_value=self._ok(refresh_token="rotated")):
-            refreshed = refresh_credential(_credential())
-        assert refreshed["token"]["refresh_token"] == "rotated"
-
-    def test_uses_the_client_id_from_the_login(self):
-        """A rotated client must not strand the refresh on a stale constant."""
-        credential = {"id_token": _id_token(aud="live-client"),
-                      "token": {"access_token": "a", "refresh_token": "r"}}
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          return_value=self._ok()) as urlopen:
-            refresh_credential(credential)
-        body = urlopen.call_args.args[0].data.decode()
-        assert "client_id=live-client" in body
-        assert "grant_type=refresh_token" in body
-
-    def test_falls_back_to_the_known_client_id(self):
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          return_value=self._ok()) as urlopen:
-            refresh_credential({"token": {"access_token": "a", "refresh_token": "r"}})
-        assert antigravity.FALLBACK_CLIENT_ID in urlopen.call_args.args[0].data.decode()
-
-    def test_no_refresh_token_names_the_fix(self):
-        with pytest.raises(AntigravityError, match="sign in with 'agy'"):
-            refresh_credential(_credential(refresh=None))
-
-    @pytest.mark.parametrize("code", [400, 401, 403])
-    def test_a_dead_refresh_token_says_so(self, code):
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          side_effect=_http_error(code)):
-            with pytest.raises(AntigravityError, match="expired or revoked") as caught:
-                refresh_credential(_credential())
-        assert caught.value.status_code == code
-
-    def test_a_server_error_is_reported_as_itself(self):
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          side_effect=_http_error(500)):
-            with pytest.raises(AntigravityError, match=r"refresh failed \(500\)"):
-                refresh_credential(_credential())
-
-    def test_a_response_without_a_token_is_rejected(self):
-        with patch.object(antigravity.urllib.request, "urlopen",
-                          return_value=_Response({"scope": "..."})):
-            with pytest.raises(AntigravityError, match="no access token"):
-                refresh_credential(_credential())
-
-
 # ---------------------------------------------------------------------------
 # Quota parsing
 # ---------------------------------------------------------------------------
@@ -421,57 +357,48 @@ class TestProjectId:
 
 
 class TestReadUsage:
-    def test_a_live_token_is_used_as_is(self):
-        credential = _credential(expiry=NOW + 3600)
-        with (patch.object(antigravity, "refresh_credential") as refresh,
-              patch.object(antigravity.urllib.request, "urlopen",
-                           return_value=_Response(QUOTA_PAYLOAD))):
-            usage = read_usage(credential=credential, now=NOW)
-        assert not refresh.called and len(usage.groups) == 2
+    """ccswap reads this login; the Antigravity CLI maintains it.
 
-    def test_an_aged_token_is_refreshed_first(self):
-        credential = _credential(expiry=NOW - 1)
-        fresh = _credential(expiry=NOW + 3600)
-        fresh["token"]["access_token"] = "renewed"
-        with (patch.object(antigravity, "refresh_credential", return_value=fresh) as refresh,
-              patch.object(antigravity.urllib.request, "urlopen",
-                           return_value=_Response(QUOTA_PAYLOAD)) as urlopen):
-            read_usage(credential=credential, now=NOW)
-        assert refresh.called
-        assert urlopen.call_args.args[0].get_header("Authorization") == "Bearer renewed"
+    Refresh is deliberately not attempted. Antigravity's OAuth client is
+    confidential — Google answers a client-id-only refresh with
+    "client_secret is missing" — and every ``agy`` command re-mints the token
+    anyway. Measured 2026-09-15.
+    """
 
-    def test_a_rejected_live_token_is_refreshed_and_retried_once(self):
-        """Clock skew or a server-side revocation can reject a token that
-        still looks valid; one retry separates a stale login from a dead one."""
-        responses = [_http_error(401), _Response(QUOTA_PAYLOAD)]
-
-        def urlopen(*args, **kwargs):
-            item = responses.pop(0)
-            if isinstance(item, Exception):
-                raise item
-            return item
-
-        with (patch.object(antigravity, "refresh_credential",
-                           return_value=_credential(expiry=NOW + 3600)) as refresh,
-              patch.object(antigravity.urllib.request, "urlopen", side_effect=urlopen)):
+    def test_a_live_token_is_used(self):
+        with patch.object(antigravity.urllib.request, "urlopen",
+                          return_value=_Response(QUOTA_PAYLOAD)):
             usage = read_usage(credential=_credential(expiry=NOW + 3600), now=NOW)
-        assert refresh.call_count == 1 and len(usage.groups) == 2
+        assert len(usage.groups) == 2
 
-    def test_the_retry_happens_only_once(self):
-        with (patch.object(antigravity, "refresh_credential",
-                           return_value=_credential(expiry=NOW + 3600)),
-              patch.object(antigravity.urllib.request, "urlopen",
-                           side_effect=_http_error(403))):
-            with pytest.raises(AntigravityError):
+    def test_an_aged_token_names_the_one_line_fix(self):
+        """Never a silent failure, and never a refresh that cannot succeed."""
+        with patch.object(antigravity.urllib.request, "urlopen") as urlopen:
+            with pytest.raises(AntigravityError, match="expired") as caught:
+                read_usage(credential=_credential(expiry=NOW - 1), now=NOW)
+        assert not urlopen.called          # no pointless request
+        assert "agy" in str(caught.value)
+
+    def test_an_unknown_expiry_is_still_attempted(self):
+        """A token with no recorded expiry may well work; try it."""
+        with patch.object(antigravity.urllib.request, "urlopen",
+                          return_value=_Response(QUOTA_PAYLOAD)):
+            assert read_usage(credential=_credential(), now=NOW).groups
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_a_refused_live_token_gets_the_same_remedy(self, code):
+        """Clock skew or a revocation can refuse a token that looks live."""
+        with patch.object(antigravity.urllib.request, "urlopen",
+                          side_effect=_http_error(code)):
+            with pytest.raises(AntigravityError, match="agy") as caught:
                 read_usage(credential=_credential(expiry=NOW + 3600), now=NOW)
+        assert caught.value.status_code == code
 
-    def test_a_non_auth_failure_is_not_retried(self):
-        with (patch.object(antigravity, "refresh_credential") as refresh,
-              patch.object(antigravity.urllib.request, "urlopen",
-                           side_effect=_http_error(500))):
+    def test_a_non_auth_failure_keeps_its_own_message(self):
+        with patch.object(antigravity.urllib.request, "urlopen",
+                          side_effect=_http_error(500)):
             with pytest.raises(AntigravityError, match=r"\(500\)"):
                 read_usage(credential=_credential(expiry=NOW + 3600), now=NOW)
-        assert not refresh.called
 
     def test_reads_the_keychain_when_given_no_credential(self, block_real_keychain):
         block_real_keychain.set_password("gemini", "antigravity",
@@ -480,17 +407,17 @@ class TestReadUsage:
                           return_value=_Response(QUOTA_PAYLOAD)):
             assert read_usage(now=NOW).email == "matt@example.com"
 
-    def test_the_keychain_is_never_written_back(self, block_real_keychain):
-        """ccswap does not own this login; rewriting another tool's
-        credential is a race it can only lose."""
-        original = _blob(_credential(expiry=NOW - 1))
+    def test_the_keychain_is_never_written(self, block_real_keychain):
+        """ccswap does not own this login and must not race the CLI for it."""
+        original = _blob(_credential(expiry=NOW + 3600))
         block_real_keychain.set_password("gemini", "antigravity", original)
-        with (patch.object(antigravity, "refresh_credential",
-                           return_value=_credential(expiry=NOW + 3600)),
-              patch.object(antigravity.urllib.request, "urlopen",
-                           return_value=_Response(QUOTA_PAYLOAD))):
+        with patch.object(antigravity.urllib.request, "urlopen",
+                          return_value=_Response(QUOTA_PAYLOAD)):
             read_usage(now=NOW)
         assert block_real_keychain.get_password("gemini", "antigravity") == original
+
+    def test_the_hint_names_a_command_that_exists(self):
+        assert "agy" in REFRESH_HINT
 
 
 # ---------------------------------------------------------------------------

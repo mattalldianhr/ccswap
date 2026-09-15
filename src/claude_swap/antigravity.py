@@ -19,6 +19,14 @@ each will look like an auth failure if lost:
 - The credential is a ``go-keyring`` blob, not raw JSON: Keychain holds
   ``go-keyring-base64:<base64 of the JSON document>``.
 
+**Token refresh belongs to the Antigravity CLI, not to us.** Its OAuth client
+is a *confidential* one: Google rejects a refresh that carries only the client
+id with ``"client_secret is missing"``. The secret is the CLI's, and prising it
+out to impersonate that client would be both fragile and wrong. Running any
+``agy`` command refreshes the token in place (measured 2026-09-15: expiry moved
+an hour out), so when the stored token has aged out the honest answer is to say
+so and name the command that fixes it.
+
 This is an internal Google endpoint with no compatibility promise. Every
 failure path therefore raises :class:`AntigravityError` and callers are
 expected to degrade to "unknown", never to break a dashboard that is also
@@ -32,7 +40,6 @@ import json
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,7 +47,6 @@ from pathlib import Path
 from typing import Any
 
 QUOTA_URL = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
-REFRESH_URL = "https://oauth2.googleapis.com/token"
 
 # The Keychain item the Antigravity CLI writes its login to.
 KEYCHAIN_SERVICE = "gemini"
@@ -56,15 +62,12 @@ PROJECT_ID_CACHE = "cache/default_project_id.txt"
 # absent prefix returns 403 with a licensing message. See the module docstring.
 USER_AGENT = "antigravity-cli/1.2.3"
 
-# Antigravity's own OAuth client, read from the login's id_token when present
-# so a rotated client does not strand the refresh path on a stale constant.
-FALLBACK_CLIENT_ID = (
-    "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-)
+# Treat a token as unusable slightly before its stated expiry, so a request
+# that would die in flight is reported as a stale login instead of a 401.
+EXPIRY_SKEW_S = 60.0
 
-# Refresh this far ahead of expiry rather than at it: a token that dies
-# mid-flight costs a whole poll cycle, and the refresh is cheap.
-REFRESH_SKEW_S = 120.0
+# What the user runs to refresh. Any agy command re-mints the token in place.
+REFRESH_HINT = "run any 'agy' command (for example 'agy models') to refresh it"
 
 # ccswap's window vocabulary, so Antigravity rows sort and render beside the
 # Claude and Codex ones instead of inventing a third set of names.
@@ -238,78 +241,14 @@ def token_expiry(credential: dict[str, Any]) -> float | None:
     return parsed.timestamp()
 
 
-def token_expired(credential: dict[str, Any], *, now: float, skew_s: float = REFRESH_SKEW_S) -> bool:
-    """Whether the access token is expired or close enough to count as expired.
+def token_expired(credential: dict[str, Any], *, now: float, skew_s: float = EXPIRY_SKEW_S) -> bool:
+    """Whether the stored access token has aged out.
 
     An unknown expiry is *not* treated as expired: the token may well work, and
-    a needless refresh burns the refresh token's rotation for nothing.
+    the only thing this decides is whether to attempt the request at all.
     """
     expiry = token_expiry(credential)
     return expiry is not None and now >= expiry - skew_s
-
-
-def refresh_credential(
-    credential: dict[str, Any],
-    *,
-    refresh_url: str = REFRESH_URL,
-    timeout: float = 10.0,
-) -> dict[str, Any]:
-    """Return ``credential`` with a freshly minted access token.
-
-    Google's installed-app flow does not rotate the refresh token, so the
-    result can be used without persisting it first. The document is copied
-    through JSON rather than mutated, so a caller's snapshot is never changed
-    underneath it.
-    """
-    token = credential.get("token")
-    refresh_token = token.get("refresh_token") if isinstance(token, dict) else None
-    if not isinstance(refresh_token, str) or not refresh_token:
-        raise AntigravityError("Antigravity login has no refresh token; sign in with 'agy'")
-    client_id = _id_claims(credential).get("aud") or FALLBACK_CLIENT_ID
-    body = urllib.parse.urlencode({
-        "client_id": client_id,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    }).encode("utf-8")
-    request = urllib.request.Request(
-        refresh_url,
-        data=body,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise AntigravityError(
-            "Antigravity refresh token is expired or revoked; sign in again with 'agy'"
-            if exc.code in (400, 401, 403)
-            else f"Antigravity token refresh failed ({exc.code})",
-            status_code=exc.code,
-        ) from exc
-    except (urllib.error.URLError, OSError) as exc:
-        raise AntigravityError(f"Antigravity token refresh failed: {exc}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AntigravityError(f"Could not decode the Antigravity refresh response: {exc}") from exc
-
-    access_token = payload.get("access_token") if isinstance(payload, dict) else None
-    if not isinstance(access_token, str) or not access_token:
-        raise AntigravityError("Antigravity refresh response has no access token")
-    refreshed = json.loads(json.dumps(credential))
-    refreshed["token"]["access_token"] = access_token
-    expires_in = payload.get("expires_in")
-    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
-        refreshed["token"]["expiry"] = _iso(
-            datetime.now(timezone.utc).timestamp() + float(expires_in)
-        )
-    rotated = payload.get("refresh_token")
-    if isinstance(rotated, str) and rotated:
-        refreshed["token"]["refresh_token"] = rotated
-    return refreshed
 
 
 # ---------------------------------------------------------------------------
@@ -442,28 +381,29 @@ def read_usage(
     now: float | None = None,
     timeout: float = 15.0,
 ) -> AntigravityUsage:
-    """Read Antigravity quota, refreshing the access token when it has aged out.
+    """Read Antigravity quota using the login the Antigravity CLI maintains.
 
-    The refreshed credential is deliberately *not* written back to the
-    Keychain. ccswap does not own this login — the Antigravity CLI does — and
-    a read-only integration that rewrites another tool's credential can only
-    lose that race, never win it. The cost is one refresh per poll after the
-    token ages out, which is cheap.
+    ccswap never refreshes and never writes this credential. The CLI owns it,
+    its OAuth client is confidential (see the module docstring), and every
+    ``agy`` command re-mints the token in place. So an aged-out token is
+    reported as exactly that, with the one-line fix, rather than being papered
+    over with a refresh that cannot succeed.
     """
     now = now if now is not None else time.time()
     credential = credential if credential is not None else read_credential()
     if token_expired(credential, now=now):
-        credential = refresh_credential(credential, timeout=timeout)
+        raise AntigravityError(f"the Antigravity login has expired; {REFRESH_HINT}")
     try:
         return fetch_quota(credential, timeout=timeout)
     except AntigravityError as exc:
-        # An unexpired-looking token can still be rejected (clock skew, a
-        # server-side revocation). One refresh-and-retry distinguishes a dead
-        # login from a stale one.
-        if exc.status_code not in (401, 403):
-            raise
-        refreshed = refresh_credential(credential, timeout=timeout)
-        return fetch_quota(refreshed, timeout=timeout)
+        # A token that still looks live can be refused anyway (clock skew, a
+        # server-side revocation). Same remedy, so say the same thing.
+        if exc.status_code in (401, 403):
+            raise AntigravityError(
+                f"Antigravity refused the stored login; {REFRESH_HINT}",
+                status_code=exc.status_code,
+            ) from exc
+        raise
 
 
 def available(*, service: str = KEYCHAIN_SERVICE, account: str = KEYCHAIN_ACCOUNT) -> bool:
