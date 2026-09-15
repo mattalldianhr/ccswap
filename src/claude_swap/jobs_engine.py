@@ -234,11 +234,20 @@ class TickOutcome(enum.Enum):
 # -- idle detection --------------------------------------------------------------
 
 
+# A `busy` record whose status has not been updated in this long is not a
+# working session: Claude Code was killed (or crashed) mid-turn and never got
+# to write `idle`. Measured 2026-09-15: two such records, 46h and 90h stale,
+# held the whole queue at `not-quiet` overnight while capacity sat free.
+# Real work updates its status far more often than this.
+BUSY_STALE_S = 30 * 60.0
+
+
 @dataclass(frozen=True)
 class IdleReport:
     idle_s: float | None  # seconds since the last busy interactive session; None = unknown
     busy: tuple[ClaudeSession, ...] = ()
     unreadable: int = 0
+    stale_busy: int = 0  # `busy` records too old to believe
 
 
 def interactive_idle(
@@ -250,30 +259,42 @@ def interactive_idle(
 ) -> IdleReport:
     """How long every interactive session has been idle.
 
-    Reads the session records under the default config home and every
-    session profile. A ``busy`` record means idle 0; otherwise the newest
+    Reads the session records under the default config home and every session
+    profile. A *fresh* ``busy`` record means idle 0; otherwise the newest
     ``statusUpdatedAt`` across records bounds the idle time from below. A
     machine with no interactive sessions at all is idle "forever".
+
+    A ``busy`` record older than ``BUSY_STALE_S`` is ignored: the process is
+    still alive (``scan_sessions`` checks the pid) but its status is a lie
+    left by a killed turn. Without this, one abandoned terminal blocks the
+    queue forever.
     """
     newest_status: float | None = None
     busy: list[ClaudeSession] = []
     unreadable = 0
+    stale_busy = 0
     for root in (claude_home, *profile_dirs):
         sessions, bad = scan_sessions(claude_dir=root)
         unreadable += bad
         for s in sessions:
             if s.pid in exclude_pids or s.kind != "interactive":
                 continue
-            if s.status == "busy":
-                busy.append(s)
             stamp = _status_updated_at(root, s.pid)
+            if s.status == "busy":
+                if stamp is not None and now - stamp > BUSY_STALE_S:
+                    stale_busy += 1  # killed mid-turn; not actually working
+                else:
+                    busy.append(s)
             if stamp is not None:
                 newest_status = stamp if newest_status is None else max(newest_status, stamp)
     if busy:
-        return IdleReport(idle_s=0.0, busy=tuple(busy), unreadable=unreadable)
+        return IdleReport(idle_s=0.0, busy=tuple(busy), unreadable=unreadable, stale_busy=stale_busy)
     if newest_status is None:
-        return IdleReport(idle_s=float("inf") if unreadable == 0 else None, unreadable=unreadable)
-    return IdleReport(idle_s=max(0.0, now - newest_status), unreadable=unreadable)
+        return IdleReport(
+            idle_s=float("inf") if unreadable == 0 else None,
+            unreadable=unreadable, stale_busy=stale_busy,
+        )
+    return IdleReport(idle_s=max(0.0, now - newest_status), unreadable=unreadable, stale_busy=stale_busy)
 
 
 def _status_updated_at(root: Path, pid: int) -> float | None:
@@ -502,10 +523,10 @@ class JobsEngine:
             return TickOutcome.HELD
         if not quiet:
             busy = ", ".join(sorted({s.cwd.rsplit("/", 1)[-1] for s in idle.busy})) if idle.busy else ""
-            self._emit(HoldEvent(
-                reason="not-quiet",
-                detail=(f"busy: {busy}" if busy else f"idle {idle.idle_s / 60:.0f}m < {self.settings.quiet_minutes:.0f}m"),
-            ))
+            detail = f"busy: {busy}" if busy else f"idle {idle.idle_s / 60:.0f}m < {self.settings.quiet_minutes:.0f}m"
+            if idle.stale_busy:
+                detail += f" ({idle.stale_busy} stale busy record(s) ignored)"
+            self._emit(HoldEvent(reason="not-quiet", detail=detail))
             return TickOutcome.HELD
 
         for job in queued:

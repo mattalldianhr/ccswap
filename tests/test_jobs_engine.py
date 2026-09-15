@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap.jobs import Job, JobStore, new_job_id
+from claude_swap.process_detection import ClaudeSession
 from claude_swap.jobs_engine import (
     ErrorEvent,
     HoldEvent,
@@ -313,3 +314,51 @@ class TestPooledDecisions:
         hold = events[-1]
         assert hold.reason == "no-capacity"
         assert "pooled spare" in hold.detail and "refills in" in hold.detail
+
+
+class TestStaleBusyRecords:
+    """A killed turn leaves `busy` behind; it must not block the queue."""
+
+    def test_stale_busy_is_ignored(self, tmp_path):
+        _session_file(tmp_path, os.getpid(), status="busy", updated_ms=(NOW - 3 * 3600) * 1000)
+        rep = interactive_idle(now=NOW, claude_home=tmp_path, profile_dirs=())
+        assert rep.busy == () and rep.stale_busy == 1
+        assert rep.idle_s == 3 * 3600  # idle measured from that stamp
+
+    def test_fresh_busy_still_blocks(self, tmp_path):
+        _session_file(tmp_path, os.getpid(), status="busy", updated_ms=(NOW - 60) * 1000)
+        rep = interactive_idle(now=NOW, claude_home=tmp_path, profile_dirs=())
+        assert rep.idle_s == 0.0 and len(rep.busy) == 1 and rep.stale_busy == 0
+
+    def test_boundary(self, tmp_path):
+        from claude_swap.jobs_engine import BUSY_STALE_S
+
+        _session_file(tmp_path, os.getpid(), status="busy", updated_ms=(NOW - BUSY_STALE_S + 30) * 1000)
+        assert interactive_idle(now=NOW, claude_home=tmp_path, profile_dirs=()).idle_s == 0.0
+        _session_file(tmp_path, os.getpid(), status="busy", updated_ms=(NOW - BUSY_STALE_S - 30) * 1000)
+        assert interactive_idle(now=NOW, claude_home=tmp_path, profile_dirs=()).busy == ()
+
+    def test_one_stale_does_not_mask_a_real_busy_session(self, tmp_path):
+        home, prof = tmp_path / "home", tmp_path / "prof"
+        _session_file(home, 4242, status="busy", updated_ms=(NOW - 90 * 3600) * 1000)
+        _session_file(prof, os.getpid(), status="busy", updated_ms=(NOW - 30) * 1000)
+        with patch("claude_swap.jobs_engine.scan_sessions", side_effect=lambda claude_dir: (
+            [ClaudeSession(pid=os.getpid() if claude_dir == prof else 4242, session_id="s",
+                           cwd="/tmp", started_at=0, kind="interactive", entrypoint="cli",
+                           status="busy")], 0)):
+            rep = interactive_idle(now=NOW, claude_home=home, profile_dirs=(prof,))
+        assert len(rep.busy) == 1 and rep.stale_busy == 1
+        assert rep.idle_s == 0.0
+
+    def test_stale_busy_lets_a_job_start(self, harness, tmp_path):
+        """The overnight failure, end to end."""
+        entries = {"1": _entry(10, 42, now=NOW), "2": _entry(0, 100, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True,
+                                           settings=JobsSettings(quiet_minutes=20))
+        _session_file(tmp_path / "claude-home", os.getpid(), status="busy",
+                      updated_ms=(NOW - 46 * 3600) * 1000)
+        _queue(store, tmp_path, estimate_pct=5.0)
+        try:
+            assert engine.tick() is TickOutcome.STARTED
+        finally:
+            p.stop()

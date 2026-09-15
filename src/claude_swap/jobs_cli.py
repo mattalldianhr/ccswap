@@ -482,6 +482,8 @@ def _capacity(args, *, switcher, settings, store, runner, **_) -> int:
           + (accent("quiet") if quiet else warning_text("busy")))
     if idle.busy:
         print(dimmed("  busy: " + ", ".join(sorted({_short_folder(s.cwd) for s in idle.busy}))))
+    if idle.stale_busy:
+        print(dimmed(f"  ignoring {idle.stale_busy} stale 'busy' record(s) from killed sessions"))
     for cap in caps:
         head = f"\n{bolded(f'#{cap.number}')} {cap.email}"
         if cap.usage_error:
