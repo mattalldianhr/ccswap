@@ -809,12 +809,31 @@ class JobRunner:
         if job.state == "queued" or job.state == "paused":
             return self.store.update(job.id, state="cancelled", finished_at=get_timestamp())
         if job.state == "running":
+            # Signal the worker's process GROUP, not the bare pids. The worker is
+            # a group leader (``start_new_session=True``) and its ``claude -p``
+            # children — which may spawn further `claude -p` calls of their own —
+            # share its PGID. Killing pids alone orphans them: on 2026-09-17 a
+            # cancelled draft-collect left two of them running, still spending
+            # quota on a job the queue had already marked failed.
             for pid in (job.claude_pid, job.worker_pid):
-                if pid and is_pid_alive(pid):
+                if not (pid and is_pid_alive(pid)):
+                    continue
+                try:
+                    pgid = os.getpgid(pid)
+                except OSError:
+                    pgid = None
+                # Group-signal only a real group leader, and never our own group:
+                # a pid sharing this process's group would take the caller down.
+                if pgid is not None and pgid == pid and pgid != os.getpgrp():
                     try:
-                        os.kill(pid, signal.SIGTERM)
+                        os.killpg(pgid, signal.SIGTERM)
+                        continue
                     except OSError:
                         pass
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
             return self.store.update(
                 job.id, state="cancelled", finished_at=get_timestamp(),
                 worker_pid=None, claude_pid=None, error="cancelled",
@@ -830,13 +849,47 @@ class JobRunner:
         )
 
 
+def _signal_group(proc: subprocess.Popen, sig: int) -> bool:
+    """Signal the worker's whole process group; fall back to the bare process.
+
+    Workers are spawned with ``start_new_session=True``, so the worker is a
+    process-group leader and its ``claude -p`` children share its PGID. Signalling
+    only ``proc.pid`` leaves those children running: on 2026-09-17 a cancelled
+    ``draft-collect`` left two ``claude -p`` processes burning quota against a job
+    the queue had already marked ``failed``.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+    # Only signal the group when this process actually LEADS one. A child that
+    # shares our group (anything spawned without start_new_session, as in the
+    # tests) would otherwise take the signal to our own process group down with
+    # it — killpg there kills the test runner, not the job.
+    if pgid is not None and pgid == proc.pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return True
+        except OSError:
+            pass
+    try:
+        proc.send_signal(sig)
+        return True
+    except OSError:
+        return False
+
+
 def _terminate(proc: subprocess.Popen) -> None:
     try:
-        proc.terminate()
+        if not _signal_group(proc, signal.SIGTERM):
+            return
         proc.wait(timeout=_KILL_GRACE_S)
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=5)
+        _signal_group(proc, signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
     except OSError:
         pass
 
