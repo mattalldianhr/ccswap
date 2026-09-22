@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
 import sys
+import time
 from unittest.mock import patch
 
 import pytest
@@ -23,6 +25,7 @@ from claude_swap.jobs import (
     tail_stream_text,
     validate_job_fields,
 )
+from claude_swap.process_detection import is_pid_alive
 from claude_swap.settings import JobsSettings
 from tests.test_autoswitch import EngineHarness
 
@@ -298,6 +301,41 @@ class TestRunner:
         ):
             assert runner.run_worker(job.id) == 1
         assert "timed out" in store.get(job.id).error
+
+    def test_run_worker_timeout_kills_nested_claude(self, harness, tmp_path):
+        # claude -p can spawn further claude -p calls. On timeout the whole tree
+        # must die, not just the top pid: bb81f0e only group-signals a real group
+        # leader, so claude needs a session of its own for that to reach the tree.
+        store, runner = self._runner(harness, tmp_path, job_timeout_minutes=1.0)
+        runner.settings = JobsSettings(job_timeout_minutes=0.02)  # ~1.2s
+        work = tmp_path / "work"
+        work.mkdir()
+        pidfile = tmp_path / "grandchild.pid"
+        fake = tmp_path / "claude"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"sleep 30 & echo $! > {pidfile}\n"
+            "sleep 30\n"
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+        job = store.add(_job(work, account="1"))
+        with (
+            patch("claude_swap.jobs.shutil.which", return_value=str(fake)),
+            patch.object(runner, "_usage_point", return_value=UsagePoint(None, None, None, None, {}, None)),
+            patch("claude_swap.jobs._KILL_GRACE_S", 1.0),
+        ):
+            assert runner.run_worker(job.id) == 1
+        assert "timed out" in store.get(job.id).error
+        grandchild = int(pidfile.read_text())
+        try:
+            for _ in range(20):
+                if not is_pid_alive(grandchild):
+                    break
+                time.sleep(0.1)
+            assert not is_pid_alive(grandchild), "nested claude survived the timeout"
+        finally:
+            with contextlib.suppress(OSError):
+                os.kill(grandchild, 9)
 
     def test_run_worker_refuses_non_queued(self, harness, tmp_path):
         store, runner = self._runner(harness, tmp_path)
