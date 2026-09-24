@@ -191,9 +191,12 @@ class FakeSwitcher:
         print(f"Added Account {slot or 9}")
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        models: tuple[str, ...],
+        account_windows: tuple[str, ...] = ("5h", "7d"),
     ) -> None:
-        self._poll_inputs_override = (threshold, models)
+        self._poll_inputs_override = (threshold, models, account_windows)
 
     def clear_poll_policy_inputs(self) -> None:
         self._poll_inputs_override = None
@@ -2317,6 +2320,39 @@ class TestAutoScreen:
             # below #3 (50% binding).
             assert plain.index("user3@example.com") < plain.index(
                 "user2@example.com"
+            )
+
+    async def test_candidates_ranking_honors_configured_windows(
+        self, tmp_path, fake_engine
+    ):
+        """The 'Next best' ranking must use the same window set as the
+        engine: with autoswitch.windows=5h, an account's 7d pct must not
+        bind the ranking, same as `_headroom_by_account` in the engine."""
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1, "autoswitch": {"windows": "5h"},
+        }))
+        fake = FakeSwitcher(
+            [
+                make_account(1, active=True, entry=make_entry(91.0, 20.0)),
+                make_account(2, entry=make_entry(20.0, 95.0)),
+                make_account(3, entry=make_entry(50.0, 30.0)),
+            ],
+            tmp_path,
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            await settle(pilot)
+            from textual.widgets import Static
+
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            # On the full 5h/7d view #2's 95% 7d would bind it worst (below
+            # #3); scoped to 5h alone (autoswitch.windows=5h) its 20% ranks
+            # it ahead of #3's 50%.
+            assert plain.index("user2@example.com") < plain.index(
+                "user3@example.com"
             )
 
 
