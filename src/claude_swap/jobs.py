@@ -718,6 +718,11 @@ class JobRunner:
                     stdout=out,
                     stderr=err,
                     stdin=subprocess.DEVNULL,
+                    # Its own group, so the timeout's _terminate (which group-signals
+                    # only a real leader) reaches nested `claude -p` calls too.
+                    # Otherwise claude shares the worker's group and only its bare
+                    # pid is signalled, orphaning the rest of the tree.
+                    start_new_session=True,
                 )
                 store.update(job.id, claude_pid=proc.pid, account_used=email)
                 try:
