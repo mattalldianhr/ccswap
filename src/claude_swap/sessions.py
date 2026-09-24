@@ -145,7 +145,8 @@ class TranscriptState:
     model: str | None = None
     last_prompt: str | None = None
     last_reply: str | None = None
-    last_ts: float | None = None
+    last_ts: float | None = None  # last assistant activity
+    last_user_ts: float | None = None  # last real prompt from the person
     input_tokens: int = 0
     output_tokens: int = 0
     cache_read: int = 0
@@ -211,6 +212,7 @@ def apply_line(st: TranscriptState, line: str) -> None:
         text = _text_of((d.get("message") or {}).get("content"))
         if text.strip() and not text.startswith(("<local-command", "<command-", "<task-notification", "<system-reminder")):
             st.last_prompt = _excerpt(text)
+            st.last_user_ts = _ts(d.get("timestamp")) or st.last_user_ts
     elif t == "assistant" and not d.get("isSidechain"):
         msg = d.get("message") or {}
         st.model = msg.get("model") or st.model
@@ -306,6 +308,7 @@ class SessionInfo:
     version: str | None
     tmux: str | None
     started_at: float | None
+    status_since: float | None
     transcript: Path | None
     state: TranscriptState
     proc: Proc | None
@@ -315,6 +318,12 @@ class SessionInfo:
     @property
     def title(self) -> str:
         return self.state.title or self.name or Path(self.cwd).name or f"pid {self.pid}"
+
+    @property
+    def last_active(self) -> float | None:
+        """Most recent sign of life: a prompt, agent activity, or a status change."""
+        stamps = [t for t in (self.state.last_user_ts, self.state.last_ts, self.status_since) if t]
+        return max(stamps) if stamps else self.started_at
 
     @property
     def mode(self) -> str:
@@ -389,11 +398,13 @@ def snapshot(
             if tpath:
                 live_paths.add(tpath)
             started = rec.get("startedAt")
+            since = rec.get("statusUpdatedAt") or rec.get("updatedAt")
             rows.append(SessionInfo(
                 pid=pid, session_id=sid, cwd=cwd, account=prof.account,
                 name=rec.get("name"), status=rec.get("status"), kind=rec.get("kind", ""),
                 entrypoint=rec.get("entrypoint", ""), version=rec.get("version"),
                 tmux=rec.get("tmux"), started_at=started / 1000 if started else None,
+                status_since=since / 1000 if since else None,
                 transcript=tpath, state=st, proc=procs.get(pid), job=jobs.get(pid),
             ))
     # claude processes with no record: old versions, or a record we cannot read.
@@ -414,11 +425,11 @@ def snapshot(
         rows.append(SessionInfo(
             pid=p.pid, session_id="", cwd="", account="?", name=name, status=None,
             kind="teammate" if parent_sid else "", entrypoint="", version=None, tmux=None,
-            started_at=None, transcript=None, state=TranscriptState(), proc=p,
+            started_at=None, status_since=None, transcript=None, state=TranscriptState(), proc=p,
             job=jobs.get(p.pid), registered=False,
         ))
     cache.prune(live_paths)
-    rows.sort(key=lambda r: -(r.state.last_ts or r.started_at or 0))
+    rows.sort(key=lambda r: -(r.last_active or 0))
     return rows
 
 

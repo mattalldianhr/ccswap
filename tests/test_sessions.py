@@ -196,3 +196,32 @@ class TestSessionsScreen:
                 await pilot.press("escape")
                 await pilot.pause()
                 kill.assert_not_called()
+
+
+class TestLastActive:
+    def test_prompt_time_is_tracked(self, tmp_path):
+        p = tmp_path / "t.jsonl"
+        _write_transcript(p, [
+            {"type": "user", "timestamp": _iso(NOW - 3600), "message": {"content": "do it"}},
+            {"type": "user", "timestamp": _iso(NOW - 10), "message": {"content": [{"type": "tool_result", "content": "x"}]}},
+            _assistant("m1", NOW - 60, "done"),
+        ])
+        st = S.TranscriptCache().read(p)
+        assert abs(st.last_user_ts - (NOW - 3600)) < 2  # tool results are not the person
+        assert abs(st.last_ts - (NOW - 60)) < 2
+
+    def test_latest_signal_wins_and_rows_sort_by_it(self, tmp_path):
+        me = os.getpid()
+        claude_dir = tmp_path / "claude"
+        # Record A: transcript quiet for a day, but its status changed a minute ago.
+        _record(claude_dir, me, "a", "/w/a", status="idle", statusUpdatedAt=(NOW - 60) * 1000)
+        _write_transcript(claude_dir / "projects" / S.project_slug("/w/a") / "a.jsonl",
+                          [_assistant("m1", NOW - 86400, "old")])
+        rows = S.snapshot(claude_dir, None, S.TranscriptCache(), ps={})
+        assert abs(rows[0].last_active - (NOW - 60)) < 2
+
+    def test_falls_back_to_start_time(self):
+        r = S.SessionInfo(pid=1, session_id="", cwd="", account="?", name=None, status=None, kind="",
+                          entrypoint="", version=None, tmux=None, started_at=123.0, status_since=None,
+                          transcript=None, state=S.TranscriptState(), proc=None)
+        assert r.last_active == 123.0

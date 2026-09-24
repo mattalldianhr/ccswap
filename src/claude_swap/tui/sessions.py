@@ -94,7 +94,7 @@ class SessionsScreen(Screen):
 
     def on_mount(self) -> None:
         t = self.query_one("#sessions-table", DataTable)
-        t.add_columns("", "Title", "Mode", "Acct", "Folder", "Active", "Out", "Total", "Procs")
+        t.add_columns("", "Title", "Mode", "Acct", "Folder", "Last active", "Out", "Total", "Procs")
         p = self.query_one("#sessions-procs", DataTable)
         p.add_columns("PID", "Kind", "CPU%", "Mem", "Age", "Command")
         t.focus()
@@ -170,7 +170,7 @@ class SessionsScreen(Screen):
         now = time.time()
         for r in rows:
             dot, colour = STATUS_DOT.get(r.status or "", ("·", "dim"))
-            last = r.state.last_ts
+            last = r.last_active
             t.add_row(
                 Text(dot, style=colour),
                 Text(r.title[:48]),
@@ -228,6 +228,16 @@ class SessionsScreen(Screen):
             d.append(f"ccswap job: {r.job}\n", style="magenta")
         if r.tmux:
             d.append(f"tmux {r.tmux}\n", style="cyan")
+        now = time.time()
+        seen = []
+        if st.last_user_ts:
+            seen.append(f"you {ago(now - st.last_user_ts)}")
+        if st.last_ts:
+            seen.append(f"agent {ago(now - st.last_ts)}")
+        if r.status and r.status_since:
+            seen.append(f"{r.status} for {format_duration(max(now - r.status_since, 0))}")
+        if seen:
+            d.append("last active: " + " · ".join(seen) + "\n")
         d.append(f"tokens: out {human(st.output_tokens)} · in {human(st.input_tokens)} · cache read "
                  f"{human(st.cache_read)} · cache write {human(st.cache_write)}\n")
         if st.last_prompt:
