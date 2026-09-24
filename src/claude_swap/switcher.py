@@ -85,7 +85,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    parse_model_names,
+    parse_window_selection,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -347,9 +352,14 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
-        self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
-        self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
+        # (settings mtime, (threshold, models, account_windows)) — see
+        # _poll_policy_inputs.
+        self._poll_inputs_cache: (
+            tuple[float | None, tuple[float, tuple[str, ...], tuple[str, ...]]] | None
+        ) = None
+        self._poll_inputs_override: (
+            tuple[float, tuple[str, ...], tuple[str, ...]] | None
+        ) = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -1807,12 +1817,15 @@ class ClaudeAccountSwitcher:
         }
 
     def set_poll_policy_inputs(
-        self, threshold: float, models: tuple[str, ...]
+        self,
+        threshold: float,
+        models: tuple[str, ...],
+        account_windows: tuple[str, ...] = ("5h", "7d"),
     ) -> None:
-        """Pin the threshold/models poll planning keys on (set by a hosted
-        auto engine so cadence follows its effective, CLI-merged settings
-        instead of the settings file)."""
-        self._poll_inputs_override = (threshold, models)
+        """Pin the threshold/models/account_windows poll planning keys on (set
+        by a hosted auto engine so cadence follows its effective, CLI-merged
+        settings instead of the settings file)."""
+        self._poll_inputs_override = (threshold, models, account_windows)
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1821,10 +1834,11 @@ class ClaudeAccountSwitcher:
         engine it belonged to is gone."""
         self._poll_inputs_override = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
-        """Threshold + configured model names for poll planning: the hosting
-        engine's pinned values when present, else the settings file (reloaded
-        only when it changes — one stat per pass)."""
+    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
+        """Threshold + configured model names + account-window selection for
+        poll planning: the hosting engine's pinned values when present, else
+        the settings file (reloaded only when it changes — one stat per
+        pass)."""
         if self._poll_inputs_override is not None:
             return self._poll_inputs_override
         path = settings_path(self.backup_dir)
@@ -1835,7 +1849,11 @@ class ClaudeAccountSwitcher:
         if self._poll_inputs_cache is not None and self._poll_inputs_cache[0] == mtime:
             return self._poll_inputs_cache[1]
         loaded = load_settings(self.backup_dir)
-        inputs = (loaded.threshold, parse_model_names(loaded.model))
+        inputs = (
+            loaded.threshold,
+            parse_model_names(loaded.model),
+            parse_window_selection(loaded.windows),
+        )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
 
@@ -4993,8 +5011,13 @@ class ClaudeAccountSwitcher:
         }
         info_by_num = {str(info[0]): info for info in accounts_info}
         # Scoped-window models so the 429-stale trust bound honors per-model
-        # (e.g. Fable) resets, matching the poll planner's window view.
-        _threshold, models = self._poll_policy_inputs()
+        # (e.g. Fable) resets, matching the poll planner's window view. The
+        # trust bound deliberately keeps the full 5h/7d view regardless of
+        # autoswitch.windows: whether cached data is still fresh is
+        # objective and must not move with that preference, and this
+        # collector also backs `ccswap list`, the TUI and the manual switch
+        # strategies, none of which the setting scopes.
+        _threshold, models, _account_windows = self._poll_policy_inputs()
         sentinels: dict[str, str] = {}
         for num, info in info_by_num.items():
             static = self._static_usage_sentinel(info)
@@ -5209,7 +5232,11 @@ class ClaudeAccountSwitcher:
         for when the backoff lifts.
         """
         now = self._usage_store.clock()
-        threshold, models = self._poll_policy_inputs()
+        # Cadence planning deliberately keeps the full 5h/7d view regardless
+        # of autoswitch.windows: excluding a window here would make polling
+        # itself blind to it, not just the switch decision, and users can
+        # still see the ignored window's usage in `ccswap list`.
+        threshold, models, _account_windows = self._poll_policy_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
