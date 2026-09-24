@@ -68,6 +68,38 @@ class TestStore:
         assert store.claim_for_run(j.id, os.getpid()) is None
         assert store.get(j.id).state == "running"
 
+    def test_claim_respects_max_concurrent(self, tmp_path):
+        """The limit is enforced inside the claim's lock, so a second scheduler
+        cannot start a *different* job once the slots are full."""
+        store = JobStore(tmp_path)
+        a = store.add(_job(tmp_path, name="a"))
+        b = store.add(_job(tmp_path, name="b"))
+        with patch("claude_swap.jobs.is_pid_alive", return_value=True):
+            assert store.claim_for_run(a.id, os.getpid(), max_concurrent=1) is not None
+            assert store.claim_for_run(b.id, os.getpid(), max_concurrent=1) is None
+            assert store.get(b.id).state == "queued"
+            assert store.claim_for_run(b.id, os.getpid(), max_concurrent=2) is not None
+
+    def test_claim_without_max_concurrent_is_unbounded(self, tmp_path):
+        """Omitting the limit keeps the old behaviour, so `jobs start` and the
+        worker's own re-claim are unaffected."""
+        store = JobStore(tmp_path)
+        a = store.add(_job(tmp_path, name="a"))
+        b = store.add(_job(tmp_path, name="b"))
+        with patch("claude_swap.jobs.is_pid_alive", return_value=True):
+            assert store.claim_for_run(a.id, os.getpid()) is not None
+            assert store.claim_for_run(b.id, os.getpid()) is not None
+
+    def test_claim_ignores_dead_workers_when_counting(self, tmp_path):
+        """A crashed worker must not occupy a concurrency slot forever."""
+        store = JobStore(tmp_path)
+        a = store.add(_job(tmp_path, name="a"))
+        b = store.add(_job(tmp_path, name="b"))
+        store.claim_for_run(a.id, 4242)
+        with patch("claude_swap.jobs.is_pid_alive", return_value=False):
+            assert store.claim_for_run(b.id, os.getpid(), max_concurrent=1) is not None
+        assert store.get(a.id).state == "failed"
+
     def test_dead_worker_is_reconciled(self, tmp_path):
         store = JobStore(tmp_path)
         j = store.add(_job(tmp_path))

@@ -30,6 +30,7 @@ is a read-modify-write under that lock and nothing holds the lock across a
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -400,14 +401,32 @@ class JobStore:
             shutil.rmtree(self.log_dir(job_id), ignore_errors=True)
         return True
 
-    def claim_for_run(self, job_id: str, worker_pid: int) -> Job | None:
+    def claim_for_run(
+        self, job_id: str, worker_pid: int, *, max_concurrent: int | None = None
+    ) -> Job | None:
         """Atomically move a queued job to ``running``; None if it was not
-        queued any more (another launcher got there first)."""
+        queued any more (another launcher got there first).
+
+        ``max_concurrent`` re-checks the running count inside this lock. The
+        engine's own check happens early in the tick, long before the claim, so
+        two schedulers ticking concurrently can each see room and each start a
+        *different* job — never the same one twice, but more at once than the
+        limit allows. Passing the limit here closes that window: the count is
+        read and the state transition written under one lock.
+        """
         with self._lock():
             jobs = self._read()
             job = jobs.get(job_id)
             if job is None or job.state != "queued":
                 return None
+            if max_concurrent is not None:
+                jobs = self._reconcile_locked(jobs)
+                job = jobs.get(job_id)
+                if job is None or job.state != "queued":
+                    return None
+                running = sum(1 for j in jobs.values() if j.state == "running")
+                if running >= max_concurrent:
+                    return None
             job = replace(
                 job,
                 state="running",
@@ -588,9 +607,17 @@ class JobRunner:
                 env=env,
                 start_new_session=True,
             )
-        claimed = self.store.claim_for_run(job.id, proc.pid)
+        claimed = self.store.claim_for_run(
+            job.id, proc.pid, max_concurrent=self.settings.max_concurrent
+        )
         if claimed is None:
-            # Lost the race; the worker will notice the job is not queued and exit.
+            # Lost the race, or another scheduler filled the last concurrency
+            # slot between this tick's check and now. The worker re-checks the
+            # state itself and exits 3, but do not leave it to discover that on
+            # its own -- reap it here so a losing tick spawns nothing lasting.
+            proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=5)
             raise JobError(f"Job {job.short_id} was started elsewhere")
         return claimed
 
