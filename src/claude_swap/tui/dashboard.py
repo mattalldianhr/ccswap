@@ -71,6 +71,7 @@ class DashboardScreen(Screen):
         # Power shortcuts; the menu is the discoverable path.
         Binding("g", "app.open_auto", "Auto view", show=False),
         Binding("b", "app.open_jobs", "Jobs", show=False),
+        Binding("S", "app.open_sessions", "Sessions"),
         Binding("y", "app.open_antigravity", "Antigravity", show=False),
         Binding("f", "app.refresh_full", "Refresh usage", show=False),
         Binding("j", "cursor_down", show=False),
@@ -107,6 +108,7 @@ class DashboardScreen(Screen):
             ("Switch account…", "switch"),
             ("Watch accounts", "watch"),
             ("Auto-switch view…", "auto"),
+            ("Sessions…", "sessions"),
             ("Jobs…", "jobs"),
             ("Reserves…", "reserves"),
             *(
@@ -275,6 +277,7 @@ class DashboardScreen(Screen):
         actions: dict[str, Callable[[], None]] = {
             "switch": self.action_open_switch,
             "watch": app.action_open_watch,
+            "sessions": app.action_open_sessions,
             "jobs": app.action_open_jobs,
             "reserves": app.action_open_reserves,
             "antigravity": app.action_open_antigravity,

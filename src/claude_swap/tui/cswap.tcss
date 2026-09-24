@@ -442,3 +442,47 @@ ReserveFormModal {
     padding: 1 2;
     border-top: solid $panel;
 }
+
+/* Sessions screen */
+#sessions-top {
+    height: auto;
+    background: $background;
+    padding: 1 2 0 2;
+}
+
+#sessions-chart {
+    height: 3;
+    margin: 0 0 1 0;
+}
+
+#sessions-table {
+    height: 1fr;
+    min-height: 6;
+    background: $background;
+    padding: 0 1;
+}
+
+#sessions-bottom {
+    height: 1fr;
+    min-height: 10;
+    padding: 0 1;
+}
+
+#sessions-detail-col {
+    width: 1fr;
+    padding: 0 1;
+}
+
+#sessions-detail {
+    height: auto;
+}
+
+#sessions-spark {
+    height: 2;
+    margin: 1 0 0 0;
+}
+
+#sessions-procs {
+    width: 1fr;
+    background: $background;
+}

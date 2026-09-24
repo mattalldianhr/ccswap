@@ -964,6 +964,7 @@ class TestDashboard:
                 "switch",
                 "watch",
                 "auto",
+                "sessions",
                 "jobs",
                 "reserves",
                 "add-menu",
@@ -976,8 +977,8 @@ class TestDashboard:
 
             auto_item = next(item for item in root_items if item.action_id == "auto")
             assert auto_item.query_one(Static).render().plain == "Auto-switch view…"
-            # nest into Add (index 5), then back out with escape
-            await pilot.press("down", "down", "down", "down", "down", "enter")
+            # nest into Add (index 6), then back out with escape
+            await pilot.press("down", "down", "down", "down", "down", "down", "enter")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
             assert ids == ["add-login:claude", "add-token", "add-login:codex", "back"]
