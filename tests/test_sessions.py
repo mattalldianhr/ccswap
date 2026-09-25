@@ -225,3 +225,25 @@ class TestLastActive:
                           entrypoint="", version=None, tmux=None, started_at=123.0, status_since=None,
                           transcript=None, state=S.TranscriptState(), proc=None)
         assert r.last_active == 123.0
+
+
+class TestKill:
+    def test_windows_tree_kill_uses_taskkill(self):
+        # Windows has no os.getpgid/os.killpg; a tree kill must go through taskkill.
+        done = type("R", (), {"returncode": 0})()
+        with (
+            patch.object(S.sys, "platform", "win32"),
+            patch("claude_swap.process_detection.subprocess.run", return_value=done) as run,
+        ):
+            S.kill(4242, tree=True)
+        assert run.call_args.args[0] == ["taskkill", "/PID", "4242", "/T", "/F"]
+
+    def test_windows_tree_kill_failure_is_an_oserror(self):
+        # The TUI reports OSError to the user; anything else would crash the screen.
+        failed = type("R", (), {"returncode": 128})()
+        with (
+            patch.object(S.sys, "platform", "win32"),
+            patch("claude_swap.process_detection.subprocess.run", return_value=failed),
+            pytest.raises(OSError),
+        ):
+            S.kill(4242, tree=True)

@@ -194,11 +194,26 @@ class TestArgvAndParsing:
         assert cost_delta(before, UsagePoint(None, None, None, None, {}, None)) == (None, None, {})
 
 
+def _python_claude(path, body):
+    """A stand-in `claude` that runs ``body`` with this interpreter.
+
+    POSIX runs a shebang script directly. Windows cannot exec one
+    (WinError 193), so there the script sits behind a ``claude.cmd`` wrapper,
+    the way an npm-installed claude does.
+    """
+    script = path / "claude"
+    script.write_text(f"#!{sys.executable}\n{body}")
+    if sys.platform == "win32":
+        wrapper = path / "claude.cmd"
+        wrapper.write_text(f'@"{sys.executable}" "{script}" %*\n')
+        return wrapper
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    return script
+
+
 def _fake_claude(path, *, exit_code=0, is_error=False, sleep=0.0):
     """A stand-in `claude` that writes a stream-json result to stdout."""
-    script = path / "claude"
-    body = f"""#!{sys.executable}
-import json, sys, time, os
+    body = f"""import json, sys, time, os
 time.sleep({sleep})
 print(json.dumps({{"type": "system", "session_id": "fake-sid"}}))
 print(json.dumps({{"type": "assistant", "message": {{"content": [{{"type": "text", "text": "hi"}}]}}}}))
@@ -208,9 +223,7 @@ print(json.dumps({{"type": "result", "session_id": "fake-sid", "is_error": {str(
 open(os.path.join(os.getcwd(), "touched"), "w").write(os.environ.get("CLAUDE_CONFIG_DIR", ""))
 sys.exit({exit_code})
 """
-    script.write_text(body)
-    script.chmod(script.stat().st_mode | stat.S_IEXEC)
-    return script
+    return _python_claude(path, body)
 
 
 @pytest.fixture
@@ -311,13 +324,15 @@ class TestRunner:
         work = tmp_path / "work"
         work.mkdir()
         pidfile = tmp_path / "grandchild.pid"
-        fake = tmp_path / "claude"
-        fake.write_text(
-            "#!/bin/sh\n"
-            f"sleep 30 & echo $! > {pidfile}\n"
-            "sleep 30\n"
+        # The grandchild stays in claude's group (POSIX) / tree (Windows), as a
+        # nested `claude -p` would.
+        fake = _python_claude(
+            tmp_path,
+            "import subprocess, sys, time\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+            f"open({str(pidfile)!r}, 'w').write(str(child.pid))\n"
+            "time.sleep(30)\n",
         )
-        fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
         job = store.add(_job(work, account="1"))
         with (
             patch("claude_swap.jobs.shutil.which", return_value=str(fake)),
@@ -365,12 +380,20 @@ class TestRunner:
         assert cancelled.state == "cancelled" and cancelled.worker_pid is None
         import time
 
-        for _ in range(50):
-            try:
-                os.kill(pid, 0)
-                os.waitpid(pid, os.WNOHANG)
+        if sys.platform == "win32":
+            # os.kill(pid, 0) is CTRL_C_EVENT on Windows, not a probe.
+            for _ in range(50):
+                if not is_pid_alive(pid):
+                    break
                 time.sleep(0.05)
-            except (ProcessLookupError, ChildProcessError):
-                break
+            assert not is_pid_alive(pid), "cancel left the worker running"
+        else:
+            for _ in range(50):
+                try:
+                    os.kill(pid, 0)
+                    os.waitpid(pid, os.WNOHANG)
+                    time.sleep(0.05)
+                except (ProcessLookupError, ChildProcessError):
+                    break
         with pytest.raises(JobError):
             runner.requeue(store.update(job.id, state="running", worker_pid=os.getpid()))
