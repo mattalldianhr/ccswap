@@ -26,12 +26,13 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from claude_swap.process_detection import is_pid_alive, pid_matches_record
+from claude_swap.process_detection import is_pid_alive, kill_tree_windows, pid_matches_record
 
 BUCKET_S = 60
 TIMELINE_S = 5 * 3600
@@ -448,6 +449,11 @@ def kill(pid: int, *, tree: bool) -> None:
     """SIGTERM a process, or its whole group when it leads one that is not ours."""
     import signal
 
+    if tree and sys.platform == "win32":
+        # No process groups on Windows; end the pid's tree instead.
+        if not kill_tree_windows(pid):
+            raise OSError(f"taskkill could not end process tree {pid}")
+        return
     if tree:
         try:
             pgid = os.getpgid(pid)

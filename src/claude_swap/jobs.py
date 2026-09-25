@@ -48,7 +48,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock
 from claude_swap.mappings import normalize_path
 from claude_swap.models import get_timestamp
-from claude_swap.process_detection import is_pid_alive
+from claude_swap.process_detection import detached_popen_kwargs, is_pid_alive, kill_tree_windows
 from claude_swap.settings import JobsSettings, atomic_write_json
 
 if TYPE_CHECKING:
@@ -605,7 +605,7 @@ class JobRunner:
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
                 env=env,
-                start_new_session=True,
+                **detached_popen_kwargs(),
             )
         claimed = self.store.claim_for_run(
             job.id, proc.pid, max_concurrent=self.settings.max_concurrent
@@ -722,7 +722,7 @@ class JobRunner:
                     # only a real leader) reaches nested `claude -p` calls too.
                     # Otherwise claude shares the worker's group and only its bare
                     # pid is signalled, orphaning the rest of the tree.
-                    start_new_session=True,
+                    **detached_popen_kwargs(),
                 )
                 store.update(job.id, claude_pid=proc.pid, account_used=email)
                 try:
@@ -850,6 +850,9 @@ class JobRunner:
             for pid in (job.claude_pid, job.worker_pid):
                 if not (pid and is_pid_alive(pid)):
                     continue
+                if sys.platform == "win32":
+                    kill_tree_windows(pid)
+                    continue
                 try:
                     pgid = os.getpgid(pid)
                 except OSError:
@@ -912,6 +915,13 @@ def _signal_group(proc: subprocess.Popen, sig: int) -> bool:
 
 
 def _terminate(proc: subprocess.Popen) -> None:
+    if sys.platform == "win32":
+        # No SIGTERM grace on Windows: a windowless console process can only
+        # be ended, so end the whole tree at once.
+        kill_tree_windows(proc.pid)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        return
     try:
         if not _signal_group(proc, signal.SIGTERM):
             return

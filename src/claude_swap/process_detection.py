@@ -100,6 +100,41 @@ def _is_pid_alive_windows(pid: int) -> bool:
         return False
 
 
+def kill_tree_windows(pid: int) -> bool:
+    """End ``pid`` and every process it started. Windows only.
+
+    Windows has no process groups to signal (no ``os.getpgid``/``os.killpg``,
+    no ``SIGKILL``), so ``taskkill /T`` walks the parent-pid tree instead,
+    reaching nested ``claude -p`` calls the way ``killpg`` does on POSIX.
+    ``/F`` is required: a console process with no window (the job worker,
+    ``claude -p``) cannot be asked to close, only ended. True when taskkill
+    reports success.
+    """
+    try:
+        rc = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            timeout=10,
+        ).returncode
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return rc == 0
+
+
+def detached_popen_kwargs() -> dict:
+    """``Popen`` kwargs that detach a child from our terminal and group.
+
+    POSIX: a new session, so the child leads its own process group. Windows
+    ignores ``start_new_session``; the equivalent is a new process group (our
+    Ctrl+C does not reach it) on a console of its own with no window (closing
+    the terminal that launched it does not end it, and no window flashes up
+    when the scheduler starts it).
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW}
+    return {"start_new_session": True}
+
+
 def _ps(pid: int, *columns: str) -> str | None:
     """``ps -o`` ``columns`` for ``pid``, or None when unknowable.
 
