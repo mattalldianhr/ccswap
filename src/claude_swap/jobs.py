@@ -48,6 +48,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.locking import FileLock
 from claude_swap.mappings import normalize_path
 from claude_swap.models import get_timestamp
+from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.process_detection import is_pid_alive
 from claude_swap.settings import JobsSettings, atomic_write_json
 
@@ -511,6 +512,22 @@ class UsagePoint:
         )
 
 
+# Reset timestamps closer than this are the same window. The usage API
+# restates ``resets_at`` on every poll with sub-second jitter, and no window
+# is shorter than five hours, so anything under this is not a rollover.
+_RESET_JITTER_S = 300.0
+
+
+def _same_window(ra: str | None, rb: str | None) -> bool:
+    """Whether two ``resets_at`` values name the same usage window."""
+    if ra == rb:
+        return True
+    ta, tb = parse_reset_ts(ra), parse_reset_ts(rb)
+    if ta is None or tb is None:
+        return False
+    return abs(ta - tb) <= _RESET_JITTER_S
+
+
 def cost_delta(before: UsagePoint, after: UsagePoint) -> tuple[float | None, float | None, dict[str, float]]:
     """Window deltas between two points; a reset in between yields None for
     that window (the delta would be meaningless)."""
@@ -518,7 +535,7 @@ def cost_delta(before: UsagePoint, after: UsagePoint) -> tuple[float | None, flo
     def delta(a: float | None, b: float | None, ra: str | None, rb: str | None) -> float | None:
         if a is None or b is None:
             return None
-        if ra and rb and ra != rb:
+        if ra and rb and not _same_window(ra, rb):
             return None  # window rolled over mid-run
         return max(0.0, b - a) if b >= a else None
 

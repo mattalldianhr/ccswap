@@ -193,6 +193,26 @@ class TestArgvAndParsing:
         assert (c5, c7, cs) == (4.0, None, {"Fable": 2.0})
         assert cost_delta(before, UsagePoint(None, None, None, None, {}, None)) == (None, None, {})
 
+    def test_cost_delta_ignores_reset_jitter(self):
+        # The usage API restates resets_at on every poll with sub-second jitter
+        # (observed: 02:10:00.46 then 02:09:59.61 for the same window). Same
+        # window, so the delta is real. A true rollover moves the reset by the
+        # window length and still yields None.
+        before = UsagePoint(
+            1.0, "2026-10-16T02:10:00.460565+00:00",
+            16.0, "2026-10-21T08:00:00.460590+00:00", {}, 0.0,
+        )
+        after = UsagePoint(
+            47.0, "2026-10-16T02:09:59.614568+00:00",
+            22.0, "2026-10-21T07:59:59.614587+00:00", {}, 0.0,
+        )
+        assert cost_delta(before, after)[:2] == (46.0, 6.0)
+        rolled = UsagePoint(
+            3.0, "2026-10-16T07:10:00.000000+00:00",
+            22.0, "2026-10-21T08:00:00+00:00", {}, 0.0,
+        )
+        assert cost_delta(before, rolled)[:2] == (None, 6.0)
+
 
 def _fake_claude(path, *, exit_code=0, is_error=False, sleep=0.0):
     """A stand-in `claude` that writes a stream-json result to stdout."""
