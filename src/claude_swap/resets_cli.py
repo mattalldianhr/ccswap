@@ -43,7 +43,12 @@ def _clock(iso: str | None) -> str:
 def _window_line(label: str, w: dict, note: str = "") -> str:
     body = f"{w['pct']:>4.0f}%"
     cell = oauth.fresh_reset_strings(w)
-    if cell:
+    due = resets._ts(w.get("resets_at"))
+    if due is not None and due <= time.time():
+        # A stale reading whose window has since reset: its percentage and
+        # reset time describe a window that no longer exists.
+        body += f"  {_clock(w['resets_at'])}  " + muted("passed — reading predates the reset")
+    elif cell:
         body += f"  {_clock(w.get('resets_at'))}  in {cell[0]}"
     elif w.get("resets_at"):
         body += f"  {_clock(w['resets_at'])}"
