@@ -150,6 +150,9 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             rows.append(("$$", f"{pct:>3.0f}%   resets {cell[1]:<12}  ${used:,.2f} / ${limit:,.2f}"))
         else:
             rows.append(("$$", f"{pct:>3.0f}%   ${used:,.2f} / ${limit:,.2f}"))
+    details = usage.get("details") if isinstance(usage.get("details"), dict) else {}
+    if details.get("five_hour_idle") and not usage.get("five_hour"):
+        rows.append(("5h", "idle — next message opens the window"))
     for label, w in (
         ("5h", usage.get("five_hour")),
         ("7d", usage.get("seven_day")),
@@ -187,6 +190,33 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
             rows.append((w["name"], f"{w['pct']:>3.0f}%   resets {clock:<12}  in {countdown}{marker}"))
         else:
             rows.append((w["name"], f"{w['pct']:>3.0f}%{marker}"))
+    for w in details.get("extra_windows") or []:
+        cell = oauth.fresh_reset_strings(w)
+        body = f"{w['pct']:>3.0f}%"
+        if cell:
+            body += f"   resets {cell[1]:<12}  in {cell[0]}"
+        if w.get("locked"):
+            body += f"  LOCKED ({w['locked']})"
+        rows.append((w["label"], body))
+    extra = details.get("extra_usage")
+    if not spend and isinstance(extra, dict) and not extra.get("enabled") and "limit" in extra:
+        # Overage is configured but off: hitting a limit stops work rather
+        # than billing. Say why, since "out of credits" and "turned off by
+        # you" call for different fixes.
+        why = extra.get("disabled_reason") or ("off by you" if extra.get("user_disabled") else "off")
+        rows.append(("$$", f"off ({str(why).replace('_', ' ')})   "
+                           f"${extra.get('used', 0.0):,.2f} / ${extra['limit']:,.2f}"))
+    if details.get("seven_day_locked"):
+        rows.append(("Locked", f"7d window locked: {details['seven_day_locked']}"))
+    for lim in details.get("limits") or []:
+        severity = lim.get("severity")
+        if severity and severity != "normal":
+            name = lim.get("model") or lim.get("kind") or "limit"
+            rows.append(("Limit", f"{name} at {severity}"))
+    for key in sorted(details.get("other") or {}):
+        # Unrecognized non-null API field: a promo, grant or new window that
+        # ccswap does not know yet. `ccswap resets` prints the value.
+        rows.append(("New", f"API field '{key}' is set — see `ccswap resets`"))
     width = max((len(label) for label, _ in rows), default=0) + 1  # label + ':'
     return [f"{label + ':':<{width}} {body}" for label, body in rows]
 
@@ -1962,6 +1992,32 @@ class ClaudeAccountSwitcher:
         (unknown).
         """
         return self._usage_by_account()
+
+    # How far back `list` looks for unscheduled resets: one weekly window plus
+    # a day, so last week's early reset is still visible the morning after.
+    _RECENT_RESET_S = 8 * 86400.0
+
+    def _recent_reset_lines(self, email: str) -> list[str]:
+        """Dimmed note lines for unscheduled resets of ``email`` in the last
+        ``_RECENT_RESET_S``, newest first. Best-effort: history problems
+        yield no lines, never an error in ``list``."""
+        from claude_swap import resets
+
+        cache = getattr(self, "_recent_reset_events", None)
+        if cache is None:
+            try:
+                since = time.time() - self._RECENT_RESET_S
+                cache = [
+                    e for e in resets.detect(self._usage_store.history.samples(since=since))
+                    if e.unscheduled
+                ]
+            except Exception:  # noqa: BLE001 - a note is never worth breaking list
+                cache = []
+            self._recent_reset_events = cache
+        out = []
+        for e in sorted((e for e in cache if e.email == email), key=lambda e: -e.observed_at):
+            out.append(f"{dimmed('⚡')} {muted(resets.describe(e))}")
+        return out
 
     def usage_entries_by_account(
         self, fetch: set[str] | None = None, *, scheduled: bool = False
@@ -6101,6 +6157,8 @@ class ClaudeAccountSwitcher:
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
+                print(f"     {line}")
+            for line in self._recent_reset_lines(email):
                 print(f"     {line}")
 
             if show_token_status:

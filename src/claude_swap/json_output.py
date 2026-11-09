@@ -170,6 +170,10 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    if isinstance(usage.get("details"), dict):
+        # Display-only extras from oauth.usage_details, passed through as the
+        # API named them (snake_case) since unknown fields land here verbatim.
+        out["details"] = usage["details"]
     return out
 
 

@@ -532,7 +532,168 @@ def build_usage_result(data: dict) -> dict | None:
         if scoped:
             result["scoped"] = scoped
 
+    details = usage_details(data)
+    if details:
+        result["details"] = details
+
     return result if result else None
+
+
+# Top-level usage keys whose content the normalized fields above, or
+# ``usage_details`` below, already carry. Any OTHER key that arrives non-null
+# is unknown to ccswap — Anthropic ships promo and experiment windows under
+# codenames (``tangelo``, ``amber_ladder``, ...) that are null for most
+# accounts. They land in ``details["other"]`` verbatim so a new reset or
+# grant shows up the day it appears, before ccswap learns to name it.
+_DETAILED_USAGE_KEYS = frozenset({
+    "five_hour", "seven_day", "extra_usage", "limits", "spend",
+    "seven_day_breakdown", "weekly_scoped_shares", "member_dashboard_available",
+    "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps", "seven_day_cowork",
+})
+
+# Legacy per-product weekly windows: same shape as ``seven_day``, null unless
+# the plan meters that product separately.
+_EXTRA_WEEKLY_WINDOWS = (
+    ("seven_day_opus", "7d Opus"),
+    ("seven_day_sonnet", "7d Sonnet"),
+    ("seven_day_oauth_apps", "7d apps"),
+    ("seven_day_cowork", "7d Cowork"),
+)
+
+
+def usage_details(data: dict) -> dict:
+    """Everything the usage API says about limits and resets beyond the
+    windows ``build_usage_result`` normalizes. Display-only: nothing here
+    feeds switching decisions. Keys are present only when they carry
+    information, so a quiet account yields ``{}``.
+
+    - ``five_hour_idle``: the 5h window has not started (the API sends
+      ``five_hour: null`` until the next message opens one).
+    - ``seven_day_locked``: ``seven_day.locked_reason`` when Anthropic set it.
+    - ``limits``: every entry of the ``limits`` array with its ``severity``
+      and ``is_active`` (which limit currently binds).
+    - ``extra_windows``: non-null legacy per-product weekly windows.
+    - ``extra_usage``: overage state, including *why* it is off
+      (``disabled_reason``, e.g. ``out_of_credits``) — the line that says
+      whether hitting a limit stops you or starts billing.
+    - ``breakdown``: when the weekly window started and how it split across
+      surfaces (Claude Code, chat, Cowork).
+    - ``scoped_shares``: per-model share of the weekly limit.
+    - ``other``: any unrecognized non-null top-level key, verbatim.
+    """
+    if not isinstance(data, dict):
+        return {}
+    out: dict = {}
+    if "five_hour" in data and data["five_hour"] is None:
+        out["five_hour_idle"] = True
+    d7 = data.get("seven_day")
+    if isinstance(d7, dict) and d7.get("locked_reason"):
+        out["seven_day_locked"] = str(d7["locked_reason"])
+
+    limits = data.get("limits")
+    if isinstance(limits, list):
+        rows = []
+        for lim in limits:
+            if not isinstance(lim, dict):
+                continue
+            scope = lim.get("scope")
+            model = scope.get("model") if isinstance(scope, dict) else None
+            surface = scope.get("surface") if isinstance(scope, dict) else None
+            row = {
+                "kind": lim.get("kind"),
+                "group": lim.get("group"),
+                "pct": lim.get("percent"),
+                "severity": lim.get("severity"),
+                "active": bool(lim.get("is_active")),
+                "resets_at": lim.get("resets_at"),
+            }
+            if isinstance(model, dict) and model.get("display_name"):
+                row["model"] = model["display_name"]
+            if surface:
+                row["surface"] = surface if isinstance(surface, str) else json.dumps(surface)
+            rows.append({k: v for k, v in row.items() if v is not None})
+        if rows:
+            out["limits"] = rows
+
+    extra_windows = []
+    for key, label in _EXTRA_WEEKLY_WINDOWS:
+        w = data.get(key)
+        if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+            entry = {"key": key, "label": label, "pct": float(w["utilization"])}
+            if w.get("resets_at"):
+                entry["resets_at"] = w["resets_at"]
+            if w.get("locked_reason"):
+                entry["locked"] = str(w["locked_reason"])
+            extra_windows.append(entry)
+    if extra_windows:
+        out["extra_windows"] = extra_windows
+
+    eu = data.get("extra_usage")
+    if isinstance(eu, dict):
+        extra: dict = {"enabled": bool(eu.get("is_enabled"))}
+        for src, dst in (
+            ("disabled_reason", "disabled_reason"),
+            ("user_disabled", "user_disabled"),
+            ("spend_limit_reached", "limit_reached"),
+            ("currency", "currency"),
+            ("resets_at", "resets_at"),
+            ("daily", "daily"),
+            ("weekly", "weekly"),
+        ):
+            if eu.get(src) not in (None, False):
+                extra[dst] = eu[src]
+        places = eu.get("decimal_places") if isinstance(eu.get("decimal_places"), int) else 2
+        for src, dst in (("used_credits", "used"), ("monthly_limit", "limit")):
+            if isinstance(eu.get(src), (int, float)):
+                extra[dst] = float(eu[src]) / (10 ** places)
+        spend = data.get("spend")
+        if isinstance(spend, dict):
+            for src, dst in (("balance", "balance"), ("auto_reload", "auto_reload"),
+                             ("severity", "severity")):
+                if spend.get(src) not in (None, "normal"):
+                    extra[dst] = spend[src]
+        out["extra_usage"] = extra
+
+    bd = data.get("seven_day_breakdown")
+    if isinstance(bd, dict):
+        rows = [
+            {"name": r.get("display_name") or r.get("key"), "pct": r.get("percent")}
+            for r in bd.get("rows") or []
+            if isinstance(r, dict) and isinstance(r.get("percent"), (int, float))
+        ]
+        breakdown: dict = {}
+        if bd.get("window_started_at"):
+            breakdown["window_started_at"] = bd["window_started_at"]
+        if rows:
+            breakdown["rows"] = rows
+        if breakdown:
+            out["breakdown"] = breakdown
+
+    shares = data.get("weekly_scoped_shares")
+    if isinstance(shares, list) and isinstance(limits, list):
+        named = []
+        for share in shares:
+            if not isinstance(share, dict):
+                continue
+            idx = share.get("limit_index")
+            lim = limits[idx] if isinstance(idx, int) and 0 <= idx < len(limits) else None
+            scope = lim.get("scope") if isinstance(lim, dict) else None
+            model = scope.get("model") if isinstance(scope, dict) else None
+            named.append({
+                "name": (model or {}).get("display_name") or f"limit {idx}",
+                "used_pct_of_weekly": share.get("used_percent_of_weekly"),
+                "allowance_pct_of_weekly": share.get("allowance_percent_of_weekly"),
+            })
+        if named:
+            out["scoped_shares"] = named
+
+    other = {
+        k: v for k, v in data.items()
+        if k not in _DETAILED_USAGE_KEYS and v not in (None, [], {})
+    }
+    if other:
+        out["other"] = other
+    return out
 
 
 def relevant_windows(

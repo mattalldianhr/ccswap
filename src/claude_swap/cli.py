@@ -1533,6 +1533,11 @@ def main() -> None:
 
         jobs_command(argv[1:])
         return
+    if argv and argv[0] == "resets":
+        from claude_swap.resets_cli import resets_command
+
+        resets_command(argv[1:])
+        return
     if argv and argv[0] == "reserves":
         from claude_swap.jobs_cli import reserves_command
 
