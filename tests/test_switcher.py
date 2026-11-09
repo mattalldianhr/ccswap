@@ -19,6 +19,7 @@ from claude_swap.exceptions import (
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
+    LockError,
     SessionError,
     SwitchError,
     ValidationError,
@@ -990,6 +991,7 @@ class TestFetchAccountUsageSessionProfile:
         backup = _oauth_creds("sk-backup", -3600)
         session = _oauth_creds("sk-session", 7200)
         switcher._write_account_credentials("2", "test@example.com", backup)
+        self._write_profile_identity(switcher, "test@example.com", "org-uuid")
 
         with patch.object(switcher, "_live_session_pids", return_value=[]), \
              patch("claude_swap.session.read_session_credentials",
@@ -1020,6 +1022,91 @@ class TestFetchAccountUsageSessionProfile:
                    return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
             switcher._fetch_account_usage(self._info(backup))
 
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def _seed_exited_profile(self, switcher, session: str) -> Path:
+        """An exited session's profile on disk: its credential, plus the
+        identity ``_bootstrap`` writes into every profile's ``.claude.json``
+        (adoption refuses to write without one)."""
+        self._write_profile_identity(switcher, "test@example.com", "org-uuid")
+        session_dir = switcher._session_dir("2", "test@example.com")
+        (session_dir / ".credentials.json").write_text(session)
+        return session_dir
+
+    def test_unreadable_session_record_keeps_the_profile_read_only(
+        self, temp_home: Path
+    ):
+        """A record that could not be read is not "nobody there" (a claude
+        behind it may still be rotating the family): adoption is refused as
+        undecidable, and the fetch reads the profile's credential read-only,
+        as before adoption existed, rather than dropping to a backup that may
+        be a consumed generation and refreshing it."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        session_dir = self._seed_exited_profile(switcher, session)
+        (session_dir / "sessions").mkdir()
+        (session_dir / "sessions" / "9999.json").write_text("not json{{{")
+
+        with patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert kwargs.get("refresh_via") is None
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_lock_contention_keeps_the_profile_read_only(self, temp_home: Path):
+        """cswap's lock held elsewhere: adoption cannot be decided this pass,
+        and the fetch reads the profile's credential read-only instead of
+        refreshing the backup underneath whatever holds the lock."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        self._seed_exited_profile(switcher, session)
+
+        with patch("claude_swap.switcher.FileLock", side_effect=LockError("busy")), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        assert record.usage == {"five_hour": {"pct": 5}}
+        args, kwargs = mock_fetch.call_args
+        assert args[2] == session
+        assert kwargs.get("is_active") is True
+        assert switcher.read_account_credentials("2", "test@example.com") == backup
+
+    def test_failed_adoption_write_never_raises(self, temp_home: Path):
+        """``_fetch_account_usage`` never raises: it runs one worker per slot
+        under executor.map, where one slot's raise discards every slot's
+        result for the pass. A backup write that fails leaves the profile
+        ahead of a backup it could not advance, so the fetch reads the
+        profile's credential read-only and the backup is left alone."""
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        backup = _oauth_creds("sk-backup", -3600)
+        session = _oauth_creds("sk-session", 7200)
+        switcher._write_account_credentials("2", "test@example.com", backup)
+        self._seed_exited_profile(switcher, session)
+
+        with patch.object(switcher._store, "_write_account_credentials",
+                          side_effect=OSError("disk full")) as mock_write, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})) as mock_fetch:
+            record = switcher._fetch_account_usage(self._info(backup))
+
+        mock_write.assert_called_once()  # the write was reached, and failed
+        assert record.usage == {"five_hour": {"pct": 5}}
         args, kwargs = mock_fetch.call_args
         assert args[2] == session
         assert kwargs.get("is_active") is True
@@ -1196,7 +1283,9 @@ class TestAdoptSessionCredential:
         records.mkdir()
         (records / f"{os.getpid()}.json").write_text(json.dumps({"pid": os.getpid()}))
 
-        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
+        # None, not False: a live claude owns the family, so the profile's
+        # credential is still the one to read -- nothing is decided about it.
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is None
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
 
     def test_stale_marked_profile_is_not_adopted(self, temp_home: Path):
@@ -1237,6 +1326,58 @@ class TestAdoptSessionCredential:
 
         assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
         assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_unreadable_session_record_is_undecidable(self, temp_home: Path):
+        """A record we could not read is not "nobody there": a claude behind
+        it may still own the family, so nothing is written or decided."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = self._seed_profile(switcher, profile)
+        records = session_dir / "sessions"
+        records.mkdir()
+        (records / "9999.json").write_text("not json{{{", encoding="utf-8")
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is None
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    @pytest.mark.parametrize("broken", ["corrupt", "missing", "no-email"])
+    def test_profile_with_an_unreadable_identity_is_not_adopted(
+        self, temp_home: Path, broken: str
+    ):
+        """A WRITE needs the identity positively read. With ``.claude.json``
+        broken, a profile that an in-session /login re-pointed at another
+        account is indistinguishable from this slot's own newer generation,
+        and adopting it would land a foreign credential in the backup."""
+        backup = _oauth_creds("sk-backup", -3600)
+        profile = _oauth_creds("sk-session", 7200)
+        switcher = self._switcher(backup)
+        session_dir = self._seed_profile(switcher, profile)
+        identity = session_dir / ".claude.json"
+        if broken == "corrupt":
+            identity.write_text("not json{{{")
+        elif broken == "missing":
+            identity.unlink()
+        else:
+            identity.write_text(json.dumps({"oauthAccount": {}}))
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is None
+        assert switcher.read_account_credentials("2", self.EMAIL) == backup
+
+    def test_same_generation_with_an_unreadable_identity_is_not_ahead(
+        self, temp_home: Path
+    ):
+        """The control for the ordering: a profile on the backup's own
+        generation is the slot's by construction, so it answers False (the
+        backup is the truth and may be refreshed) even with its identity
+        gone -- None there would freeze the slot on a read-only fetch of an
+        expired credential."""
+        creds = _oauth_creds("sk-same", 7200)
+        switcher = self._switcher(creds)
+        session_dir = self._seed_profile(switcher, creds)
+        (session_dir / ".claude.json").unlink()
+
+        assert switcher._adopt_session_credential("2", self.EMAIL, "org-uuid") is False
 
 
 class TestLiveSessionGuardOnAnUnreadableRecord:
@@ -3101,6 +3242,39 @@ class TestActiveAccountRefresh:
         mock_refresh.assert_not_called()
         write_live.assert_called_once_with(successor)
 
+    def test_backup_restore_keeps_the_live_shared_fields(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
+    ):
+        """Restoring the backup into the live store takes the machine-shared
+        fields (mcpOAuth) from the live store, not from the backup snapshot."""
+        switcher = self._switcher(sample_sequence_data)
+        live = json.dumps({
+            **json.loads(self._EXPIRED), "mcpOAuth": {"srv": "current"},
+        })
+        successor = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-successor", "refreshToken": "rt-successor",
+                "expiresAt": 9999999999000,
+            },
+            "mcpOAuth": {"srv": "stale"},
+        })
+
+        with patch.object(switcher, "_read_credentials", return_value=live), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=successor
+             ), \
+             patch.object(switcher, "_write_credentials") as write_live, \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials") as mock_refresh, \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 5}})):
+            result = switcher._fetch_active_usage("1", "test@example.com", live)
+
+        assert result.sentinel is None
+        mock_refresh.assert_not_called()
+        written = json.loads(write_live.call_args[0][0])
+        assert written["claudeAiOauth"]["refreshToken"] == "rt-successor"
+        assert written["mcpOAuth"] == {"srv": "current"}
+
     def test_no_token_returns_no_credentials(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -3409,10 +3583,10 @@ class TestPerformSwitchPostDisplay:
         with "Claude wants to use the confidential information stored in your
         keychain" during the test run).
         """
-        def read_creds(num, email):
+        def read_creds(num, email, **_kw):
             return creds_store.get((str(num), email), "")
 
-        def read_creds_ex(num, email):
+        def read_creds_ex(num, email, **_kw):
             # The in-memory store IS the backup here, so it is never
             # "unreadable" — but it must answer the strict reader too, or
             # every caller that asks absent-vs-unreadable bypasses the
@@ -3890,6 +4064,125 @@ class TestPerformSwitchPostDisplay:
 
         assert live_state["creds"] == original_live_creds
         assert config_path.read_text() == original_config_text
+
+    def _direct_activation_with_failing_sequence_write(
+        self, temp_home: Path, on_sequence_write,
+    ):
+        """Seed an untracked login + one managed slot, then switch to it with
+        the sequence write failing after ~/.claude.json was already replaced.
+        ``on_sequence_write`` runs right before the injected failure. Returns
+        (config_path, original_config_text)."""
+        config_path = temp_home / ".claude.json"
+        original_config_text = json.dumps({
+            "oauthAccount": {
+                "emailAddress": "untracked@example.com",
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        })
+        config_path.write_text(original_config_text)
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, {
+            "activeAccountNumber": None,
+            "lastUpdated": "2024-01-01T00:00:00Z",
+            "sequence": [1],
+            "accounts": {
+                "1": {
+                    "email": "target@example.com",
+                    "uuid": "",
+                    "organizationUuid": "",
+                    "organizationName": "",
+                    "added": "2024-01-01T00:00:00Z",
+                }
+            },
+        })
+        creds_store = {
+            ("1", "target@example.com"): json.dumps({
+                "claudeAiOauth": {
+                    "accessToken": "target-token",
+                    "refreshToken": "target-refresh",
+                }
+            }),
+        }
+        configs_store = {
+            ("1", "target@example.com"): json.dumps({
+                "oauthAccount": {
+                    "emailAddress": "target@example.com",
+                    "accountUuid": "",
+                    "organizationUuid": None,
+                    "organizationName": None,
+                }
+            }),
+        }
+        live_state = {"creds": json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "live-untracked-token",
+                "refreshToken": "live-untracked-refresh",
+            }
+        })}
+        patches = self._install_store_patches(
+            switcher, creds_store, configs_store, live_state,
+        )
+        original_write_json = switcher._write_json
+
+        def failing_write_json(path, data):
+            if path == switcher.sequence_file and data.get(
+                "activeAccountNumber"
+            ) == 1:
+                on_sequence_write()
+                raise OSError("disk full")
+            return original_write_json(path, data)
+
+        try:
+            with patch.object(
+                switcher, "_write_json", side_effect=failing_write_json,
+            ), pytest.raises(OSError, match="disk full"):
+                switcher._perform_switch("1")
+        finally:
+            for p in patches:
+                p.stop()
+        return config_path, original_config_text
+
+    def test_direct_activation_rollback_publishes_config_by_rename(
+        self, temp_home: Path,
+    ):
+        """The config restore must not rewrite ~/.claude.json in place: a
+        running Claude Code watches the file, and a truncate-then-write shows
+        it an empty file (#419). Published by rename, the inode changes."""
+        seen = {}
+        config_path, original_config_text = (
+            self._direct_activation_with_failing_sequence_write(
+                temp_home,
+                lambda: seen.setdefault(
+                    "ino", (temp_home / ".claude.json").stat().st_ino
+                ),
+            )
+        )
+        assert config_path.read_text() == original_config_text
+        if sys.platform != "win32":
+            assert config_path.stat().st_ino != seen["ino"]
+            assert config_path.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob(".claude.*.tmp"))
+
+    def test_direct_activation_rollback_failure_leaves_config_intact(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """A restore that cannot publish leaves the file as it was -- still
+        the complete post-switch config, never a truncated one (#419)."""
+        def refuse(src, dst, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        config_path, _ = self._direct_activation_with_failing_sequence_write(
+            temp_home,
+            lambda: monkeypatch.setattr(
+                "claude_swap.fsutil.replace_with_retry", refuse
+            ),
+        )
+        written = json.loads(config_path.read_text())
+        assert written["oauthAccount"]["emailAddress"] == "target@example.com"
+        assert not list(temp_home.glob(".claude.*.tmp"))
 
     def test_direct_activation_fails_fast_when_live_creds_unreadable(
         self,
@@ -4470,6 +4763,145 @@ class TestDeadTokenQuarantine:
             switcher.add_account()
 
         assert not switcher._usage_store.entries({"1": identity})["1"].token_dead()
+
+
+class TestActiveQuarantineHealsFromLive:
+    """An ACTIVE slot struck on a stale backup must heal from the rotated live.
+
+    ``_entry_token_dead`` deliberately holds the strike while ANY stored
+    source (live OR backup) still carries the struck generation. Claude Code
+    rotating the live credential leaves the BACKUP on the struck generation,
+    and the only thing that resyncs it (``_resync_rotated_backup``) runs from
+    the fetch fast path — which a quarantined slot never reaches. The scan
+    must therefore attempt the resync itself, or the slot reads "re-login
+    needed" forever while Claude Code works fine on it.
+    """
+
+    _EMAIL = "test@example.com"
+    _STRUCK = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-struck", "refreshToken": "rt-struck",
+        "expiresAt": 1000}})
+    _LIVE = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-live", "refreshToken": "rt-live",
+        "expiresAt": 9999999999000}})
+    _LIVE_EXPIRED = json.dumps({"claudeAiOauth": {
+        "accessToken": "at-live", "refreshToken": "rt-live",
+        "expiresAt": 1000}})
+    _OWN_PROFILE = {"uuid": "uuid-1", "email": _EMAIL, "organizationUuid": ""}
+
+    def _setup(self, sample_sequence_data, live, *, struck_fp="struck"):
+        """Active slot 1: backup on the struck lineage, ``live`` rotated."""
+        sample_sequence_data["accounts"]["1"]["email"] = self._EMAIL
+        s = ClaudeAccountSwitcher()
+        s._setup_directories()
+        s._write_json(s.sequence_file, sample_sequence_data)
+        s._write_account_credentials("1", self._EMAIL, self._STRUCK)
+        s._write_credentials(live)
+        s._record_active_verdict(ActiveCredentials(live, False, False))
+        if struck_fp == "struck":
+            struck_fp = oauth.credential_fingerprint(self._STRUCK)
+        s._usage_store.record(
+            {"1": FetchRecord(error="invalid_grant", struck_fp=struck_fp)},
+            {"1": (self._EMAIL, "")},
+        )
+        info = [(1, self._EMAIL, "Org", "", True, live, "")]
+        return s, info
+
+    def _collect(self, s, info):
+        from claude_swap.oauth import UsageOutcome
+        with patch(
+            "claude_swap.oauth.try_fetch_usage_for_account",
+            return_value=UsageOutcome({"five_hour": {"utilization": 10}}),
+        ):
+            return s._collect_usage_entries(info)
+
+    def test_rotated_live_attributed_to_slot_heals_the_strike(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        with patch(
+            "claude_swap.oauth.fetch_oauth_profile",
+            return_value=self._OWN_PROFILE,
+        ) as probe:
+            entries = self._collect(s, info)
+
+        probe.assert_called()  # ownership was attributed, not assumed
+        assert entries["1"].sentinel != USAGE_RELOGIN_REQUIRED
+        backup, _ = s._read_account_credentials_ex("1", self._EMAIL)
+        assert backup == self._LIVE, "backup must follow the rotated live"
+        row = s._usage_store.entries({"1": (self._EMAIL, "")}, [])["1"]
+        assert row.auth_dead_strikes == 0 and row.struck_fingerprint is None
+
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            {"uuid": "uuid-other", "email": "other@example.com",
+             "organizationUuid": "org-x"},
+            None,
+        ],
+        ids=["foreign-account", "probe-unreachable"],
+    )
+    def test_unattributed_live_leaves_the_strike_and_backup(
+        self, temp_home, mock_claude_config, sample_sequence_data, profile
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=profile):
+            entries = self._collect(s, info)
+
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+        backup, _ = s._read_account_credentials_ex("1", self._EMAIL)
+        assert backup == self._STRUCK, "a foreign/unverified live must not be written"
+        assert s._usage_store.entries(
+            {"1": (self._EMAIL, "")}, []
+        )["1"].auth_dead_strikes == 1
+
+    def test_expired_live_access_token_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE_EXPIRED)
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(
+                 s, "_resync_rotated_backup",
+                 wraps=s._resync_rotated_backup,
+             ) as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_degraded_active_read_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        s, info = self._setup(sample_sequence_data, self._LIVE)
+        # Keychain read failed and a fallback covered it: the bytes may be a
+        # consumed predecessor, so nothing may be written from them.
+        s._record_active_verdict(ActiveCredentials(self._LIVE, False, True))
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(s, "_resync_rotated_backup") as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
+
+    def test_live_on_the_struck_generation_attempts_nothing(
+        self, temp_home, mock_claude_config, sample_sequence_data
+    ):
+        from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
+        # Live IS the condemned generation: nothing newer to heal from.
+        s, info = self._setup(sample_sequence_data, self._STRUCK)
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe, \
+             patch.object(s, "_resync_rotated_backup") as resync:
+            entries = self._collect(s, info)
+
+        probe.assert_not_called()
+        resync.assert_not_called()
+        assert entries["1"].sentinel == USAGE_RELOGIN_REQUIRED
 
 
 class TestAddAccountOrgFields:
@@ -5146,6 +5578,100 @@ class TestPurgeLegacyCleanup:
         assert "Legacy backup directory" not in out
 
 
+class TestLiveIdentityForTokenSlots:
+    """Live-login resolution for setup-token slots (``add-token``).
+
+    Token slots are stored personal (org ""), but Claude Code fills the real
+    organization into ``.claude.json`` from its own profile fetch. The live
+    login must still resolve to the token slot -- but only when the live
+    credential is that slot's token.
+    """
+
+    ORG = "org-uuid-1"
+    TOKEN = "sk-ant-oat01-live"
+
+    def _make_switcher(self, temp_home, accounts: dict):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        data["accounts"] = accounts
+        data["sequence"] = sorted(int(n) for n in accounts)
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @staticmethod
+    def _token_slot(email):
+        return {"email": email, "uuid": "", "organizationUuid": "", "organizationName": ""}
+
+    def _set_live(self, switcher, email, org_uuid, token):
+        switcher._write_json(
+            switcher._get_claude_config_path(),
+            {"oauthAccount": {"emailAddress": email, "organizationUuid": org_uuid}},
+        )
+        creds = json.dumps({"claudeAiOauth": {"accessToken": token}})
+        return patch.object(
+            switcher, "_read_active_credentials",
+            return_value=ActiveCredentials(creds, False),
+        )
+
+    @staticmethod
+    def _stored(token):
+        return json.dumps({"claudeAiOauth": {"accessToken": token}})
+
+    def test_enriched_org_resolves_to_token_slot(self, temp_home):
+        switcher = self._make_switcher(temp_home, {"1": self._token_slot("me@example.com")})
+        with self._set_live(switcher, "me@example.com", self.ORG, self.TOKEN), \
+             patch.object(switcher, "_read_account_credentials", return_value=self._stored(self.TOKEN)):
+            assert switcher.current_account_number() == "1"
+
+    def test_different_token_is_not_guessed_into_slot(self, temp_home):
+        """An unrelated login sharing the email stays unmanaged."""
+        switcher = self._make_switcher(temp_home, {"1": self._token_slot("me@example.com")})
+        with self._set_live(switcher, "me@example.com", self.ORG, "sk-ant-oat01-other"), \
+             patch.object(switcher, "_read_account_credentials", return_value=self._stored(self.TOKEN)):
+            assert switcher.current_account_number() is None
+
+    def test_exact_org_match_wins_without_reading_credentials(self, temp_home):
+        switcher = self._make_switcher(temp_home, {
+            "1": self._token_slot("me@example.com"),
+            "2": {"email": "me@example.com", "uuid": "acct-uuid",
+                  "organizationUuid": self.ORG, "organizationName": "Org"},
+        })
+        with self._set_live(switcher, "me@example.com", self.ORG, self.TOKEN) as active, \
+             patch.object(switcher, "_read_account_credentials") as stored:
+            assert switcher.current_account_number() == "2"
+        active.assert_not_called()
+        stored.assert_not_called()
+
+    def test_switch_rotates_instead_of_auto_adding(self, temp_home):
+        """`switch` must treat the enriched token login as managed: rotate,
+        never auto-add it as a duplicate slot."""
+        switcher = self._make_switcher(temp_home, {
+            "1": self._token_slot("me@example.com"),
+            "2": self._token_slot("other@example.com"),
+        })
+        with self._set_live(switcher, "me@example.com", self.ORG, self.TOKEN), \
+             patch.object(switcher, "_read_account_credentials", return_value=self._stored(self.TOKEN)), \
+             patch.object(switcher, "_account_is_switchable", return_value=True), \
+             patch.object(switcher, "add_account") as add, \
+             patch.object(switcher, "_perform_switch") as perform:
+            switcher.switch()
+        add.assert_not_called()
+        perform.assert_called_once()
+        assert perform.call_args.args[0] == "2"
+
+    def test_login_slot_is_not_a_fallback_candidate(self, temp_home):
+        """A personal /login slot (has an account uuid) keeps exact matching."""
+        switcher = self._make_switcher(temp_home, {
+            "1": {"email": "me@example.com", "uuid": "acct-uuid",
+                  "organizationUuid": "", "organizationName": ""},
+        })
+        with self._set_live(switcher, "me@example.com", self.ORG, self.TOKEN), \
+             patch.object(switcher, "_read_account_credentials", return_value=self._stored(self.TOKEN)):
+            assert switcher.current_account_number() is None
+
+
 class TestAddAccountFromToken:
     """Tests for add_account_from_token (--add-token flow)."""
 
@@ -5777,6 +6303,65 @@ class TestUsageAwareSwitch:
             s.switch(strategy="best")
 
         assert s._get_sequence_data()["activeAccountNumber"] == 3
+
+    @staticmethod
+    def _usage_reset(pct: float, hours: float | None) -> dict:
+        resets_at = (
+            None if hours is None
+            else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + hours * 3600))
+        )
+        return {
+            "five_hour": {"pct": 0.0},
+            "seven_day": {"pct": pct, "resets_at": resets_at},
+        }
+
+    def test_consume_first_picks_soonest_reset_over_more_headroom(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # 2 has the least headroom but resets first; 3 resets soon too but is spent.
+        usage = {
+            "1": self._usage_reset(10, 100),
+            "2": self._usage_reset(80, 20),
+            "3": self._usage_reset(100, 5),
+        }
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="consume-first")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_consume_first_stays_when_current_resets_soonest(self, temp_home: Path, capsys):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        usage = {"1": self._usage_reset(90, 10), "2": self._usage_reset(0, 50)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts") as mock_list:
+            s.switch(strategy="consume-first")
+
+        assert "resets soonest" in capsys.readouterr().out
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+        mock_list.assert_not_called()
+
+    def test_consume_first_falls_back_to_best_without_reset_times(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._make_live(temp_home, "a@example.com", 1)
+
+        # A past reset counts as unknown, so ranking falls back to headroom.
+        usage = {"1": self._usage_reset(90, -1), "2": self._usage_reset(10, None)}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy="consume-first")
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_best_stays_when_current_is_already_best(self, temp_home: Path, capsys):
         """Regression: strategy "best" must NOT move you onto a worse account when you
@@ -12576,3 +13161,77 @@ class TestSessionShellGuardCoversEveryMutator:
         s = self._switcher(sample_sequence_data, monkeypatch)
         with pytest.raises(SwitchError):
             s.unset_alias("2")
+
+
+class TestSwitchTransactionRollback:
+    """``SwitchTransaction.rollback`` restores ``~/.claude.json`` by rename,
+    never by truncating the live file in place (#419)."""
+
+    def _transaction(self, tmp_path: Path, original: str):
+        from claude_swap.models import SwitchTransaction
+
+        config_path = tmp_path / ".claude.json"
+        config_path.write_text(original)
+        tx = SwitchTransaction(
+            original_credentials="",
+            original_config=original,
+            original_account_num="1",
+            original_email="a@example.com",
+            config_path=config_path,
+        )
+        tx.record_step("config_written")
+        return tx, config_path
+
+    def test_config_restore_is_published_by_rename(self, tmp_path: Path):
+        from unittest.mock import MagicMock
+
+        original = json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}})
+        tx, config_path = self._transaction(tmp_path, original)
+        config_path.write_text("{}")  # the half-finished switch's write
+        ino = config_path.stat().st_ino
+        assert tx.rollback(MagicMock()) is True
+        assert config_path.read_text() == original
+        if sys.platform != "win32":
+            assert config_path.stat().st_ino != ino
+            assert config_path.stat().st_mode & 0o777 == 0o600
+        assert list(tmp_path.iterdir()) == [config_path]
+
+    def test_failed_config_restore_leaves_the_file_as_it_was(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        from unittest.mock import MagicMock
+
+        original = json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}})
+        tx, config_path = self._transaction(tmp_path, original)
+        config_path.write_text('{"half": "written"}')
+
+        def refuse(src, dst, **kwargs):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr("claude_swap.fsutil.replace_with_retry", refuse)
+        assert tx.rollback(MagicMock()) is False
+        assert config_path.read_text() == '{"half": "written"}'
+        assert list(tmp_path.iterdir()) == [config_path]
+
+
+class TestSalvageCopyMode:
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+    def test_salvage_copy_is_private_from_creation(
+        self, temp_home: Path, monkeypatch,
+    ):
+        """The aside copy of an unparseable ~/.claude.json can hold
+        primaryApiKey: it must be 0600 from the instant it exists, not
+        world-readable until a later chmod. With the mode call neutralised,
+        the published mode is the one the file was created with."""
+        config_path = temp_home / ".claude.json"
+        config_path.write_text('{"primaryApiKey": "sk-test", "torn":')
+        switcher = ClaudeAccountSwitcher()
+        monkeypatch.setattr("claude_swap.fsutil.os.fchmod", lambda *a, **k: None)
+        old_umask = os.umask(0o022)
+        try:
+            salvage = switcher._salvage_unreadable(config_path, False, [])
+        finally:
+            os.umask(old_umask)
+        assert salvage.read_bytes() == config_path.read_bytes()
+        assert salvage.stat().st_mode & 0o777 == 0o600
+        assert not list(temp_home.glob("*.tmp"))

@@ -7,6 +7,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,7 @@ from claude_swap.process_detection import (
     _stat_start_ticks,
     get_claude_dir,
     get_running_instances,
+    is_codex_running,
     is_pid_alive,
     list_ide_instances,
     list_sessions,
@@ -26,7 +28,9 @@ from claude_swap.process_detection import (
     process_is_claude,
     process_start_ticks,
     process_started_at,
+    scan_sessions,
 )
+from claude_swap import process_detection as detection
 from claude_swap.printer import abbreviate_path, entrypoint_label, format_age
 
 
@@ -43,6 +47,32 @@ class TestGetClaudeDir:
     def test_respects_env_var(self, tmp_path):
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(tmp_path)}):
             assert get_claude_dir() == tmp_path
+
+
+# --- is_codex_running ---
+
+
+class TestIsCodexRunning:
+    @pytest.mark.parametrize(
+        "stdout,expected",
+        [
+            ("INFORMATION: Es werden keine Aufgaben mit den angegebenen Kriterien ausgeführt.\n".encode("cp850"), False),
+            (b"Codex.exe                    1234 Console                    1     10,000 K\n", True),
+        ],
+        ids=["localized_no_tasks", "codex_running"],
+    )
+    def test_windows_bytes(self, stdout, expected):
+        with patch("claude_swap.process_detection.sys.platform", "win32"), \
+             patch("claude_swap.process_detection.subprocess.run", return_value=CompletedProcess(
+                 args=[], returncode=0, stdout=stdout,
+             )) as run:
+            assert is_codex_running() is expected
+
+        run.assert_called_once_with(
+            ["tasklist", "/FI", "IMAGENAME eq codex.exe", "/NH"],
+            capture_output=True,
+            timeout=5,
+        )
 
 
 # --- is_pid_alive ---
@@ -481,6 +511,86 @@ class TestListSessions:
         assert s.entrypoint == "claude-desktop"
 
 
+# --- scan_sessions ---
+
+
+class TestScanSessions:
+    """The guard-shaped view, where "0 live" and "0 readable" must not
+    collapse into the same answer."""
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_an_unlistable_sessions_dir_counts_as_unreadable(self, tmp_path):
+        """A directory whose listing fails hides live records exactly the way
+        an unparseable record does, so it must not answer "0 unreadable": the
+        callers read that as "nobody there" and re-bootstrap the profile under
+        a running claude.
+
+        The REAL state, not a patched scan. `Path.glob` SUPPRESSES the
+        listing's own OSError and answers an empty list, so a test that fakes
+        the raise cannot see that the raise never happens.
+        """
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        _write_session(sessions_dir, os.getpid())
+        assert scan_sessions(tmp_path) != ([], 0), "test premise"
+
+        os.chmod(sessions_dir, 0o300)  # searchable and writable, not listable
+        try:
+            sessions, unreadable = scan_sessions(tmp_path)
+        finally:
+            os.chmod(sessions_dir, 0o700)
+
+        assert sessions == []
+        assert unreadable > 0
+
+    @pytest.mark.skipif(
+        sys.platform == "win32" or os.geteuid() == 0,
+        reason="needs POSIX permission semantics (non-root)",
+    )
+    def test_an_unreachable_sessions_dir_counts_as_unreadable(self, tmp_path):
+        """The same conflation one level up: `Path.is_dir()` answers False
+        when the stat FAILS, not only when the directory is absent, so a
+        profile root that cannot be traversed reads as a profile that never
+        ran."""
+        profile = tmp_path / "profile"
+        sessions_dir = profile / "sessions"
+        sessions_dir.mkdir(parents=True)
+        _write_session(sessions_dir, os.getpid())
+
+        os.chmod(profile, 0o600)  # readable, not searchable: the stat fails
+        try:
+            sessions, unreadable = scan_sessions(profile)
+        finally:
+            os.chmod(profile, 0o700)
+
+        assert sessions == []
+        assert unreadable > 0
+
+    def test_a_missing_sessions_dir_is_provably_no_records(self, tmp_path):
+        """The one scan failure that stays at 0: a profile that has never been
+        run has no sessions directory, and refusing on that would block every
+        destructive step on it permanently."""
+        assert scan_sessions(tmp_path) == ([], 0)
+
+    def test_record_name_casing_follows_the_platform_like_glob_did(self, tmp_path):
+        """The listing used to be `glob("*.json")`, which is case-insensitive
+        on Windows and case-sensitive elsewhere; the `iterdir` filter must
+        keep that, so an upper-cased record is still seen where it used to
+        be (the guard errs toward seeing records) and ignored where it was."""
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        record = _write_session(sessions_dir, os.getpid())
+        record.rename(sessions_dir / f"{os.getpid()}.JSON")
+
+        sessions, unreadable = scan_sessions(tmp_path)
+
+        assert unreadable == 0
+        assert len(sessions) == (1 if sys.platform == "win32" else 0)
+
+
 # --- list_ide_instances ---
 
 
@@ -648,3 +758,575 @@ class TestFormatAge:
     def test_days(self):
         ms = int((time.time() - 172800) * 1000)  # 2 days ago
         assert format_age(ms) == "2d ago"
+
+
+# --- Codex session liveness ---
+
+@pytest.fixture
+def codex_proc(tmp_path, monkeypatch):
+    if not hasattr(os, "getuid"):
+        pytest.skip("fake /proc needs POSIX uids; the Linux backend is not built for Windows")
+    monkeypatch.setattr(detection.sys, "platform", "linux")
+    root = tmp_path / "proc"
+    boot = root / "sys/kernel/random"
+    boot.mkdir(parents=True)
+    (boot / "boot_id").write_text("12345678-1234-1234-1234-123456789abc")
+
+    own_ns = root / "self/ns"
+    own_ns.mkdir(parents=True)
+    (own_ns / "mnt").symlink_to("mnt:[1]")
+
+    def process(pid=42, env=b"OTHER=value\0", ticks="11485", state="S", uid=None):
+        directory = root / str(pid)
+        directory.mkdir(exist_ok=True)
+        (directory / "ns").mkdir(exist_ok=True)
+        if not (directory / "ns/mnt").is_symlink():
+            (directory / "ns/mnt").symlink_to("mnt:[1]")
+        (directory / "task" / str(pid)).mkdir(parents=True, exist_ok=True)
+        (directory / "stat").write_text(
+            STAT.replace("4242 (claude) S", f"{pid} (shell (worker)) {state}")
+                                         .replace(TICKS, ticks))
+        (directory / "environ").write_bytes(env)
+        uid = os.getuid() if uid is None else uid
+        (directory / "status").write_text(f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n")
+        return directory
+
+    return root, process
+
+
+def test_codex_identity_and_reuse(codex_proc):
+    root, process = codex_proc
+    directory = process()
+    start = detection.codex_process_identity(42, root)
+    assert start == {"kind": "linux", "bootId": "12345678-1234-1234-1234-123456789abc",
+        "ticks": TICKS}
+    assert detection.codex_process_state(42, start, root) == "alive"
+    process(ticks="999")
+    assert detection.codex_process_state(42, start, root) == "gone"
+    (directory / "stat").unlink()
+    assert detection.codex_process_identity(42, root) is None
+    assert detection.codex_process_state(42, start, root) == "unknown"
+    import shutil
+    shutil.rmtree(directory)
+    assert detection.codex_process_state(42, start, root) == "gone"
+    assert detection.codex_process_state(42, start, root / "missing") == "unknown"
+
+
+@pytest.mark.parametrize("env, expected", [
+    (b"CODEX_HOME={home}\0", "live"),
+    (b"PREFIX_CODEX_HOME={home}\0", "quiescent"),
+    (b"ARGV=CODEX_HOME={home}\0", "quiescent"),
+    (b"CODEX_HOME={home}/../session home\0", "live"),
+    (b"CODEX_HOME=relative\0", "uncertain"),
+    (b"CODEX_HOME=\0", "quiescent"),
+    (b"CODEX_HOME={home}", "uncertain"),
+    (b"OTHER=x", "quiescent"),
+    (b"broken\0", "quiescent"),
+    (b"", "quiescent"),
+])
+def test_codex_environment_bytes(codex_proc, tmp_path, env, expected):
+    root, process = codex_proc
+    home = tmp_path / "session home"
+    process(env=env.replace(b"{home}", os.fsencode(home)))
+    result = detection.scan_codex_home(home, [], proc_root=root)
+    assert result["state"] == expected
+    assert str(home) not in str(result["issues"])
+
+
+def test_codex_alias_descendants_and_orphans(codex_proc, tmp_path):
+    root, process = codex_proc
+    home = tmp_path / "home with spaces"
+    home.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(home, target_is_directory=True)
+    # No name or parent relationship is required: shim, grandchild, orphan.
+    for pid in (42, 43, 44):
+        process(pid, env=b"CODEX_HOME=" + os.fsencode(alias) + b"\0")
+    result = detection.scan_codex_home(home, [], proc_root=root)
+    assert result == {"state": "live", "pids": [42, 43, 44], "issues": [], "unreadable": 0}
+
+
+def test_codex_starting_reservation_and_invalid_records(codex_proc, tmp_path):
+    root, process = codex_proc
+    process()
+    start = detection.codex_process_identity(42, root)
+    result = detection.scan_codex_home(tmp_path, [(42, start)], 1, root)
+    assert result["state"] == "live" and result["issues"]
+    assert detection.scan_codex_home(tmp_path, [], 1, root)["state"] == "uncertain"
+    assert detection.scan_codex_home(tmp_path, [(42, {**start, "ticks": "9"})],
+                                     proc_root=root)["state"] == "quiescent"
+
+
+@pytest.mark.parametrize("filename", ["status", "stat", "environ", "boot_id"])
+@pytest.mark.parametrize("failure", [PermissionError, FileNotFoundError, ValueError])
+def test_codex_unavailable_data_is_uncertain(codex_proc, tmp_path, monkeypatch, filename, failure):
+    root, process = codex_proc
+    process()
+    original = Path.open
+
+    def denied(path, *args, **kwargs):
+        if path.name == filename:
+            raise failure("sensitive data must not appear")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", denied)
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == (
+        "quiescent" if filename == "environ" and failure is PermissionError else "uncertain")
+    assert "sensitive" not in str(result)
+    assert detection.codex_process_state(42, {}, root) in ("gone", "unknown")
+
+
+def test_codex_other_uid_and_zombie(codex_proc, tmp_path):
+    root, process = codex_proc
+    process(uid=os.getuid() + 1, env=b"")
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "quiescent"
+    process(env=b"", state="Z")
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "quiescent"
+
+
+def test_codex_conflicting_environment_keeps_positive_evidence(codex_proc, tmp_path):
+    root, process = codex_proc
+    process(env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0CODEX_HOME=/other\0")
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == "live" and result["issues"]
+
+
+def test_codex_identity_race_retries(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    process(env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    original = detection._codex_linux_snapshot
+    calls = 0
+
+    def changed(pid, proc_root, boot=None):
+        nonlocal calls
+        calls += 1
+        identity, *rest = original(pid, proc_root, boot)
+        if calls == 2:
+            identity["ticks"] = "999"
+        return (identity, *rest)
+
+    monkeypatch.setattr(detection, "_codex_linux_snapshot", changed)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "live"
+    assert calls == 6
+    calls = 0
+
+    def unstable(pid, proc_root, boot=None):
+        nonlocal calls
+        calls += 1
+        identity, *rest = original(pid, proc_root, boot)
+        identity["ticks"] = str(calls)
+        return (identity, *rest)
+
+    monkeypatch.setattr(detection, "_codex_linux_snapshot", unstable)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "uncertain"
+
+
+def test_codex_disappearance_confirmed(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    directory = process()
+    original = Path.read_bytes
+
+    def disappear(path):
+        if path == directory / "environ":
+            import shutil
+            shutil.rmtree(directory)
+            raise FileNotFoundError
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", disappear)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "quiescent"
+
+
+def test_codex_enumeration_failure_and_unsupported(codex_proc, tmp_path, monkeypatch):
+    root, _ = codex_proc
+    with patch.object(Path, "iterdir", side_effect=PermissionError):
+        assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "uncertain"
+    monkeypatch.setattr(detection.sys, "platform", "freebsd")
+    assert detection.codex_process_identity(42, root) is None
+    assert detection.codex_process_state(42, {}, root) == "unknown"
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root) == {
+        "state": "uncertain", "pids": [], "issues": ["unsupported platform"], "unreadable": 0}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux /proc smoke test")
+def test_codex_real_child_detection_and_quiescence(tmp_path):
+    import subprocess
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                             env={**os.environ, "CODEX_HOME": str(tmp_path)})
+    try:
+        result = detection.scan_codex_home(tmp_path, [])
+        assert result["state"] == "live" and child.pid in result["pids"]
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+    result = detection.scan_codex_home(tmp_path, [])
+    assert result["state"] == "quiescent", result["issues"]
+
+
+@pytest.mark.parametrize("filename, content", [
+    ("stat", "malformed"), ("status", "Uid: invalid"),
+    ("boot_id", ""), ("boot_id", "invalid-boot"),
+])
+def test_codex_malformed_process_metadata(codex_proc, tmp_path, filename, content):
+    root, process = codex_proc
+    directory = process()
+    path = root / "sys/kernel/random/boot_id" if filename == "boot_id" else directory / filename
+    path.write_text(content)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "uncertain"
+    if filename != "status":
+        assert detection.codex_process_identity(42, root) is None
+        assert detection.codex_process_state(42, {}, root) == "unknown"
+
+
+def test_codex_unresolvable_home_and_unknown_supervisor(codex_proc, tmp_path):
+    root, process = codex_proc
+    directory = process()
+    start = detection.codex_process_identity(42, root)
+    (directory / "stat").unlink()
+    result = detection.scan_codex_home(tmp_path, [(42, start)], proc_root=root)
+    assert result["state"] == "uncertain"
+    assert any("supervisor" in issue for issue in result["issues"])
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+    process(env=b"CODEX_HOME=" + os.fsencode(loop) + b"\0")
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "uncertain"
+    assert detection.scan_codex_home(loop, [], proc_root=root)["state"] == "uncertain"
+    assert detection.scan_codex_home(Path("relative"), [], proc_root=root)["state"] == "uncertain"
+
+
+@pytest.mark.parametrize("pid", [0, -1, True])
+def test_codex_invalid_pid_is_unknown(codex_proc, pid):
+    root, _ = codex_proc
+    assert detection.codex_process_identity(pid, root) is None
+    assert detection.codex_process_state(pid, {}, root) == "unknown"
+
+
+def test_codex_empty_home_is_unset_without_cwd_probe(codex_proc, tmp_path):
+    root, process = codex_proc
+    process(env=b"CODEX_HOME=\0")
+    with patch.object(Path, "readlink", side_effect=AssertionError("cwd must not be read")):
+        assert detection.scan_codex_home(tmp_path, [], proc_root=root) == {
+            "state": "quiescent", "pids": [], "issues": [], "unreadable": 0}
+
+
+@pytest.mark.parametrize("relative", ["home with spaces", "alias", "other"])
+def test_codex_relative_home_is_uncertain_even_with_cwd(codex_proc, tmp_path, relative):
+    root, process = codex_proc
+    directory = process(env=b"CODEX_HOME=" + os.fsencode(relative) + b"\0")
+    (directory / "cwd").symlink_to(tmp_path, target_is_directory=True)
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == "uncertain"
+    assert result["issues"] == ["PID 42: relative CODEX_HOME"]
+
+
+def test_codex_kernel_thread_skipped_before_environment_read(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+    directory = process(env=b"")
+    stat = directory / "stat"
+    prefix, _, rest = stat.read_text().rpartition(")")
+    fields = rest.split()
+    fields[6] = str(int(fields[6]) | 0x00200000)
+    stat.write_text(prefix + ") " + " ".join(fields))
+    with patch.object(Path, "read_bytes", side_effect=AssertionError("kernel environment read")):
+        assert detection.scan_codex_home(tmp_path, [], proc_root=root) == {
+            "state": "quiescent", "pids": [], "issues": [], "unreadable": 0}
+    # An ordinary process with an empty environment is attributed like an unreadable one.
+    fields[6] = str(int(fields[6]) & ~0x00200000)
+    stat.write_text(prefix + ") " + " ".join(fields))
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == "quiescent" and result["unreadable"] == 1
+
+
+def test_codex_boot_id_read_once_for_scan_and_supervisors(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    process()
+    process(43, env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    start = detection.codex_process_identity(42, root)
+    original = Path.read_text
+    reads = 0
+
+    def read_text(path, *args, **kwargs):
+        nonlocal reads
+        if path.name == "boot_id":
+            reads += 1
+            assert reads == 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    result = detection.scan_codex_home(tmp_path, [(42, start)], proc_root=root)
+    assert result == {"state": "live", "pids": [42, 43], "issues": [], "unreadable": 0}
+    assert reads == 1
+
+
+def _codex_edit_stat(directory, *, parent=None, comm=None):
+    path = directory / "stat"
+    prefix, _, rest = path.read_bytes().rpartition(b")")
+    fields = rest.split()
+    if parent is not None:
+        fields[1] = str(parent).encode()
+    if comm is not None:
+        prefix = str(directory.name).encode() + b" (" + comm
+    path.write_bytes(prefix + b") " + b" ".join(fields))
+
+
+def test_codex_non_utf8_comm_and_status(codex_proc, tmp_path):
+    root, process = codex_proc
+    directory = process(env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    _codex_edit_stat(directory, comm=b"worker\xff")
+    status = directory / "status"
+    status.write_bytes(b"Name:\tworker\xff\n" + status.read_bytes())
+    assert detection.codex_process_identity(42, root) is not None
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "live"
+
+
+@pytest.mark.parametrize("kind",
+    ["unrelated", "codex", "ancestor", "supervisor", "cycle", "missing"])
+@pytest.mark.parametrize("error_number", [1, 13])
+def test_codex_denied_environ_attribution(codex_proc, tmp_path, monkeypatch, kind, error_number):
+    root, process = codex_proc
+    directory = process(44)
+    supervisors = []
+    if kind == "codex":
+        _codex_edit_stat(directory, comm=b"codex-helper")
+    if kind in ("ancestor", "supervisor"):
+        process(42, env=(b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+                if kind == "ancestor" else b"OTHER=x\0")
+        middle = process(43)
+        _codex_edit_stat(middle, parent=42)
+        _codex_edit_stat(directory, parent=43)
+        if kind == "supervisor":
+            supervisors = [(42, detection.codex_process_identity(42, root))]
+    elif kind == "cycle":
+        _codex_edit_stat(directory, parent=44)
+    elif kind == "missing":
+        _codex_edit_stat(directory, parent=999)
+    original = Path.read_bytes
+
+    def denied(path):
+        if path == directory / "environ":
+            raise PermissionError(error_number, "hidden environment")
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", denied)
+    result = detection.scan_codex_home(tmp_path, supervisors, proc_root=root)
+    assert result["unreadable"] == 1
+    assert result["state"] == ("live" if kind in ("ancestor", "supervisor") else
+                               "uncertain" if kind == "codex" else "quiescent")
+    assert ("PID 44: environment unreadable" in result["issues"]) == (
+        kind in ("codex", "ancestor", "supervisor"))
+
+
+def test_codex_ancestry_bound_is_conservative(codex_proc, tmp_path, monkeypatch):
+    root, _ = codex_proc
+    calls = 0
+
+    def endless(pid, proc_root, boot):
+        nonlocal calls
+        calls += 1
+        return ({}, "S", 0, pid + 1, "helper")
+
+    monkeypatch.setattr(detection, "_codex_linux_snapshot", endless)
+    assert detection._codex_related_unreadable(({}, "S", 0, 1, "helper"), set(), root, "boot")
+    assert calls == 4096
+
+
+def test_codex_second_enumeration_finds_new_pid(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    directory = process(43, env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    original = Path.iterdir
+    passes = 0
+
+    def enumerate_proc(path):
+        nonlocal passes
+        entries = list(original(path))
+        if path == root:
+            passes += 1
+            if passes == 1:
+                entries.remove(directory)
+        return iter(entries)
+
+    monkeypatch.setattr(Path, "iterdir", enumerate_proc)
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["pids"] == [43]
+    assert passes == 2
+
+
+@pytest.mark.parametrize("namespace", ["different", "missing", "denied"])
+def test_codex_foreign_mount_namespace(codex_proc, tmp_path, monkeypatch, namespace):
+    root, process = codex_proc
+    directory = process(env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    link = directory / "ns/mnt"
+    link.unlink()
+    if namespace == "different":
+        link.symlink_to("mnt:[2]")
+    original = Path.readlink
+
+    def readlink(path):
+        if namespace == "denied" and path == link:
+            raise PermissionError
+        return original(path)
+
+    monkeypatch.setattr(Path, "readlink", readlink)
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == "uncertain"
+    assert result["issues"] == ["PID 42: foreign mount namespace"]
+
+
+def test_codex_home_inode_alias(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    home, alias = tmp_path / "home", tmp_path / "bind-mount"
+    home.mkdir()
+    alias.mkdir()
+    process(env=b"CODEX_HOME=" + os.fsencode(alias) + b"\0")
+    original = Path.stat
+
+    def bind_stat(path, *args, **kwargs):
+        return original(home if path == alias else path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", bind_stat)
+    assert detection.scan_codex_home(home, [], proc_root=root)["state"] == "live"
+
+
+@pytest.mark.parametrize("boot", [None, "invalid"])
+def test_codex_missing_pid_with_bad_boot_is_unknown(codex_proc, boot):
+    root, process = codex_proc
+    process()
+    start = detection.codex_process_identity(42, root)
+    path = root / "sys/kernel/random/boot_id"
+    if boot is None:
+        path.unlink()
+    else:
+        path.write_text(boot)
+    assert detection.codex_process_state(999, start, root) == "unknown"
+
+
+@pytest.mark.parametrize("start", [None, [], {}, {"kind": "linux"},
+    {"kind": "macos", "bootId": "boot", "ticks": "1"},
+    {"kind": "linux", "bootId": 1, "ticks": "1"},
+    {"kind": "linux", "bootId": "boot", "ticks": 1},
+    {"kind": "linux", "bootId": "boot", "ticks": "١"},
+    {"kind": "linux", "bootId": "boot", "ticks": ""},
+    {"kind": "linux", "bootId": "boot", "ticks": "1", "extra": True},
+])
+def test_codex_invalid_start_is_unknown_even_for_missing_pid(codex_proc, start):
+    root, _ = codex_proc
+    assert detection.codex_process_state(999, start, root) == "unknown"
+
+
+def test_codex_pid_reuse_during_uid_read_is_retried(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    directory = process(uid=os.getuid() + 1)
+    original = Path.read_text
+    reads = 0
+
+    def replaced(path, *args, **kwargs):
+        nonlocal reads
+        text = original(path, *args, **kwargs)
+        if path == directory / "status":
+            reads += 1
+            if reads == 1:
+                process(ticks="999", env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+        return text
+
+    monkeypatch.setattr(Path, "read_text", replaced)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "live"
+    assert reads == 3
+
+
+@pytest.mark.parametrize("thread_state, expected", [("Z", "quiescent"), ("S", "uncertain")])
+def test_codex_zombie_leader_threads(codex_proc, tmp_path, thread_state, expected):
+    root, process = codex_proc
+    directory = process(env=b"", state="Z")
+    leader = directory / "task/42/stat"
+    leader.write_bytes((directory / "stat").read_bytes())
+    thread = directory / "task/43"
+    thread.mkdir()
+    thread.joinpath("stat").write_text(
+        STAT.replace("4242 (claude) S", f"43 (worker) {thread_state}"))
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == expected
+    assert bool(result["issues"]) == (expected == "uncertain")
+
+
+@pytest.mark.parametrize("filename", ["stat", "status", "environ"])
+def test_codex_esrch_disappearance(codex_proc, tmp_path, monkeypatch, filename):
+    import shutil
+
+    root, process = codex_proc
+    directory = process()
+    original = Path.open
+
+    def disappear(path, *args, **kwargs):
+        if path == directory / filename:
+            shutil.rmtree(directory)
+            raise ProcessLookupError
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", disappear)
+    assert detection.scan_codex_home(tmp_path, [], proc_root=root)["state"] == "quiescent"
+
+
+def test_codex_two_pass_union_retains_prior_matches_and_issues(codex_proc, tmp_path, monkeypatch):
+    root, process = codex_proc
+    process(42, env=b"CODEX_HOME=" + os.fsencode(tmp_path) + b"\0")
+    process(43, env=b"CODEX_HOME=relative\0")
+    original = Path.iterdir
+    passes = 0
+
+    def enumerate_proc(path):
+        nonlocal passes
+        if path == root:
+            passes += 1
+            if passes == 2:
+                return iter([])
+        return original(path)
+
+    monkeypatch.setattr(Path, "iterdir", enumerate_proc)
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result == {"state": "live", "pids": [42],
+                      "issues": ["PID 43: relative CODEX_HOME"], "unreadable": 0}
+
+
+def test_codex_removed_start_alias_stays_uncertain(codex_proc, tmp_path):
+    """Codex canonicalizes CODEX_HOME at start; a since-removed alias may still point at H."""
+    root, process = codex_proc
+    home = tmp_path / "home"
+    home.mkdir()
+    process(env=b"CODEX_HOME=" + os.fsencode(tmp_path / "removed-alias") + b"\0")
+    assert detection.scan_codex_home(home, [], proc_root=root)["state"] == "uncertain"
+
+
+def test_codex_unreadable_name_change_between_passes(codex_proc, tmp_path, monkeypatch):
+    """A codex-named unreadable process stays an issue even if renamed before pass two."""
+    root, process = codex_proc
+    process()
+    real = detection._codex_linux_snapshot
+    names = iter(["codex-helper"] * 3 + ["worker"] * 100)
+
+    def snapshot(pid, proc_root, boot=None):
+        current = real(pid, proc_root, boot)
+        return pid == 42 and (*current[:4], next(names)) or current
+
+    monkeypatch.setattr(detection, "_codex_linux_snapshot", snapshot)
+    original = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes", lambda path: (_ for _ in ()).throw(
+        PermissionError()) if path.name == "environ" else original(path))
+    result = detection.scan_codex_home(tmp_path, [], proc_root=root)
+    assert result["state"] == "uncertain"
+
+
+@pytest.mark.parametrize("env", [b"OTHER=x", b"broken\0", b"", b"title rewritten\0\0"])
+def test_codex_garbled_environment_follows_attribution(codex_proc, tmp_path, env):
+    """setproctitle-style environments only count for codex-related processes."""
+    root, process = codex_proc
+    home = tmp_path / "home"
+    home.mkdir()
+    process(42, env=env)
+    result = detection.scan_codex_home(home, [], proc_root=root)
+    assert result["state"] == "quiescent" and result["unreadable"] == 1
+    stat_file = root / "42" / "stat"
+    stat_file.write_text(stat_file.read_text().replace("(shell (worker))", "(codex)"))
+    assert detection.scan_codex_home(home, [], proc_root=root)["state"] == "uncertain"

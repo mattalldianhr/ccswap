@@ -7,14 +7,18 @@ typed events handed to an ``on_event`` callback; the CLI renders them as
 human lines or JSONL, and any future frontend (TUI dashboard, menubar) can
 consume the same stream.
 
-Policy in one paragraph: when the active account's *binding window* (the
-higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
-the candidate with the most headroom — proactively, so the old account is
-still valid while a running Claude Code picks the new one up (this is what
-makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
+Policy in one paragraph: when ANY configured gate (the 5h window, the
+weekly window, or a named model's weekly window such as Fable) reaches its
+own threshold, switch to the candidate with the most room before its next
+gate. Unset per-gate thresholds inherit ``settings.threshold``, so with no
+overrides this is the historical rule — the higher of the 5h/7d
+utilizations crossing that one number. The switch is proactive, so the old
+account is still valid while a running Claude Code picks the new one up
+(this is what makes the macOS ~30s Keychain cache latency harmless).
+Candidates must sit ``hysteresis_pct`` below every gate so two accounts
+hovering at the line never ping-pong, and a ``cooldown_seconds`` floor
+bounds the switch rate (bypassed only when the active account is hard at
+its limit). Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
 under-lock re-read sees a fresh token and aborts its own refresh); a target
@@ -53,8 +57,10 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import (
     AutoSwitchSettings,
+    GateThresholds,
     atomic_write_json,
-    parse_model_names,
+    effective_model_names,
+    gate_thresholds,
     parse_window_selection,
 )
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -71,10 +77,10 @@ _logger = logging.getLogger("claude-swap")
 # needing a human hides behind one that clears itself. store-unmirrored and
 # invalid_client stay until somebody unsets an env var or fixes a client
 # registration, and stash-unreadable until they unlock a keychain, fix a mode,
-# or purge the row; consume-busy is gone by the next pass. stash-unreadable is
-# the one that is per-SLOT rather than global, which costs nothing here: this
-# message is only ever emitted when NO candidate freshened, so naming the real
-# cause of the only slot that had one beats "(network?)".
+# or purge the row; session-unreadable needs access restored to the records.
+# consume-busy is gone by the next pass. Unreadable state is per-SLOT, which
+# costs nothing here: this message is only emitted when NO candidate freshened,
+# so naming the real cause of the only slot that had one beats "(network?)".
 _SYSTEMIC_MESSAGES = {
     "store-unmirrored": "CLAUDE_SECURESTORAGE_CONFIG_DIR is set — unset it or "
                         "crun cswap from a normal shell",
@@ -83,6 +89,8 @@ _SYSTEMIC_MESSAGES = {
     "stash-unreadable": "a stashed successor is unreadable — unlock the "
                         "keychain or fix the file, then retry; "
                         "`ccswap unclaimed` inspects it",
+    "session-unreadable": "session state could not be read. Restore access "
+                          "and retry",
     "consume-busy": "canother cswap surface holds the slot — retries next pass",
 }
 # Insertion order IS the precedence order, so the remedy and its rank cannot
@@ -306,6 +314,18 @@ class AutoSwitchEvent:
 
 
 @dataclass(frozen=True)
+class WarmupEvent(AutoSwitchEvent):
+    kind: ClassVar[str] = "warmup"
+    message: str
+
+    def _fields(self) -> dict:
+        return {"message": self.message}
+
+    def human(self) -> str:
+        return self.message
+
+
+@dataclass(frozen=True)
 class PollEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "poll"
     active: dict | None  # account_ref shape, or None
@@ -349,6 +369,8 @@ class PollEvent(AutoSwitchEvent):
         h = self.headroom.get(str(num))
         if h is not None:
             used = f"{100 - h:.0f}% used"
+            if self.windows.get(str(num)):
+                used += f" [{self._describe(str(num))}]"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -571,6 +593,7 @@ def _binding_recovery_ts(
     models: Sequence[str],
     now: float,
     account_windows: Sequence[str] = ("5h", "7d"),
+    gates: GateThresholds | None = None,
 ) -> float:
     """When this account's *binding* window comes back, as a sort key.
 
@@ -598,7 +621,17 @@ def _binding_recovery_ts(
     windows = list(oauth.relevant_windows(usage, models, account_windows))
     if not windows:
         return float("inf")
-    _label, _pct, resets_at = max(windows, key=lambda w: w[1])
+    # Per-gate thresholds: the window holding the account back is the one
+    # closest to (or furthest past) its own wall, not the raw highest pct.
+    # With no overrides every gate shares one threshold, so that window is
+    # still the max-pct one and this branch is the historical selector.
+    if gates is not None and gates.overrides:
+        _label, _pct, resets_at = min(
+            windows,
+            key=lambda w: (gates.for_label(w[0]) - w[1], -w[1]),
+        )
+    else:
+        _label, _pct, resets_at = max(windows, key=lambda w: w[1])
     ts = _parse_reset_ts(resets_at)
     return ts if ts is not None and ts > now else float("inf")
 
@@ -666,27 +699,34 @@ class AutoSwitchEngine:
         self.settings = settings
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
-        # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and
-        # pass everywhere usage windows are read — decisions, cadence, and
-        # reset scheduling must all see the same axes.
-        self._models = parse_model_names(settings.model)
+        # separated list ("Fable", "Opus,Sonnet", "all"); names in
+        # ``settings.model_thresholds`` are gates too, even without ``model``.
+        # Parsed once here and passed everywhere usage windows are read —
+        # decisions, cadence, and reset scheduling must all see the same axes.
+        self._models = effective_model_names(settings)
         # Which of the 5h/7d account-wide windows bind the decision
         # (``settings.windows``: "both" default, "5h", or "7d") — same
         # once-parsed-everywhere treatment as ``self._models`` above.
         self._windows = parse_window_selection(settings.windows)
+        # Snapshotted at the start of each tick so a mid-tick apply_threshold
+        # cannot split one decision across two thresholds. Poll planning uses
+        # the live settings instead (see ``_pin_poll_inputs``).
+        self._decision_gates = gate_thresholds(settings)
         # Poll plans written by the collector must key on the same threshold/
         # models/windows the engine decides with (CLI overrides included), not
         # on whatever the settings file happens to say.
-        switcher.set_poll_policy_inputs(settings.threshold, self._models, self._windows)
+        self._pin_poll_inputs()
         self.on_event = on_event
         self.dry_run = dry_run
         self.state_path = state_path or (switcher.backup_dir / STATE_FILENAME)
         self.clock = clock
+        self._warmup = None
         self._stop = threading.Event()
         # Cuts the current inter-tick sleep short (a session threshold change
         # from the TUI should show a fresh decision now, not next interval).
         self._wake = threading.Event()
         self._unhealthy_ticks = 0
+        self._health_account: str | None = None
         # Both set per tick: a known-reset sleep target, and whether a BLOCKED
         # outcome is static enough (truly exhausted / no candidates) to wait
         # longer than the normal interval.
@@ -897,7 +937,22 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
+            self._persist_health_counters(self._health_account)
+            if self.settings.warmup_five_hour and not self._stop.is_set():
+                from claude_swap.warmup import WarmupEngine
+
+                if self._warmup is None:
+                    self._warmup = WarmupEngine(
+                        self.switcher, self.clock,
+                        lambda message: self._emit(WarmupEvent(message=message)),
+                        lambda: self.settings.warmup_five_hour and not self._stop.is_set(),
+                    )
+                try:
+                    self._warmup.tick(dry_run=self.dry_run)
+                except Exception:
+                    self._emit(WarmupEvent(message="Warmup unavailable; switching continues"))
+            return outcome
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
             return TickOutcome.ERROR
@@ -907,11 +962,79 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
 
+    def _load_health_counters(self, state: dict, current: str) -> None:
+        """Seed the unreadable-active counters from the state file.
+
+        They are persisted so a fresh engine per tick (``auto --once``) keeps
+        counting toward failover instead of restarting at zero. Counters left
+        by another account, or by a tick longer ago than twice the idle-hold cap,
+        are dropped. Until the managed active account changes the in-memory values
+        are authoritative, so dry-run (which never persists) and long gaps
+        between loop ticks keep their progress.
+        """
+        ticks = state.get("unhealthyTicks")
+        since = state.get("idleHoldSince")
+        at = state.get("healthTickAt")
+        fresh = (
+            state.get("healthAccount") == current
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and 0 <= self.clock() - at <= 2 * IDLE_HOLD_MAX_S
+        )
+        self._unhealthy_ticks = (
+            ticks
+            if fresh
+            and isinstance(ticks, int)
+            and not isinstance(ticks, bool)
+            and ticks > 0
+            else 0
+        )
+        self._idle_hold_since = (
+            float(since)
+            if fresh
+            and isinstance(since, (int, float))
+            and not isinstance(since, bool)
+            else None
+        )
+
+    def _persist_health_counters(self, current: str | None) -> None:
+        if self.dry_run:
+            return
+        ticks, since = self._unhealthy_ticks, self._idle_hold_since
+        now = self.clock()
+
+        def store(state: dict) -> None:
+            if current is not None and (ticks or since is not None):
+                state["unhealthyTicks"] = ticks
+                state["idleHoldSince"] = since
+                state["healthAccount"] = current
+                state["healthTickAt"] = now
+            else:
+                for key in (
+                    "unhealthyTicks", "idleHoldSince", "healthAccount",
+                    "healthTickAt",
+                ):
+                    state.pop(key, None)
+
+        stored = self._read_state()
+        if not (ticks or since is not None) and "healthAccount" not in stored:
+            return
+        self._mutate_state(store)
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
         settings = self.settings
+        # Frozen with `settings` above. apply_threshold()/apply_gates() may
+        # replace self.settings mid-tick; this tick keeps deciding on the
+        # snapshot. A gate added for a new model (Fable=40 with no
+        # autoswitch.model) brings its window in here, never partway through.
+        self._decision_gates = gate_thresholds(settings)
+        models = effective_model_names(settings)
+        if models != self._models:
+            self._models = models
+            self._model_check_done = not models
         state = self._read_state()
         if not self.dry_run:
             # Dry-run must not write anything, so recovered quarantines are
@@ -924,6 +1047,12 @@ class AutoSwitchEngine:
         )
 
         current = self.switcher.current_account_number()
+        # A tick with no managed active account keeps the current context;
+        # a different account reseeds from the state file so its counts are
+        # never inherited from the previous one.
+        if current is not None and current != self._health_account:
+            self._load_health_counters(state, current)
+            self._health_account = current
         if current is None:
             self._emit(
                 PollEvent(active=None, headroom={}, threshold=settings.threshold)
@@ -955,6 +1084,7 @@ class AutoSwitchEngine:
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        policy = self._policy_headroom_map(usage, headroom)
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -993,20 +1123,29 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
 
         active_headroom = headroom.get(current)
+        active_policy = policy.get(current)
         if active_headroom is not None:
             self._unhealthy_ticks = 0
             self._idle_hold_since = None
-            utilization = 100.0 - active_headroom
-            if utilization < settings.threshold:
+            # No per-gate overrides: the historical `max(pct) >= threshold`
+            # test, on absolute headroom. With overrides, policy headroom
+            # crosses the same line when ANY gate reaches its own threshold.
+            if self._decision_gates.overrides:
+                utilization_over = (
+                    active_policy is not None
+                    and (100.0 - active_policy) >= settings.threshold
+                )
+            else:
+                utilization_over = (100.0 - active_headroom) >= settings.threshold
+            if not utilization_over:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
                             reason="below-threshold",
                             # Both sides through pct_label: .0f utilization could
                             # display an impossible "100% < 99.9%".
-                            detail=(
-                                f"{pct_label(utilization)}% < "
-                                f"{pct_label(settings.threshold)}%"
+                            detail=self._below_threshold_detail(
+                                usage.get(current), active_headroom
                             ),
                         )
                     )
@@ -1104,9 +1243,8 @@ class AutoSwitchEngine:
             self._emit(
                 NoSwitchEvent(
                     reason="below-threshold",
-                    detail=(
-                        f"{pct_label(100.0 - active_headroom)}% < "
-                        f"{pct_label(settings.threshold)}%"
+                    detail=self._below_threshold_detail(
+                        usage.get(current), active_headroom
                     ),
                 )
             )
@@ -1185,6 +1323,7 @@ class AutoSwitchEngine:
                 recovered,
                 kw["settings"],
                 kw["current"],
+                kw["usage"],
             )
             ranked = self._rank_candidates(no_return=no_return, **kw)
             if no_return is not None and not ranked[0] and recovered:
@@ -1200,6 +1339,7 @@ class AutoSwitchEngine:
             oauth_candidates=oauth_candidates,
             usage=usage,
             headroom=headroom,
+            policy=policy,
             current=current,
             active_headroom=active_headroom,
             settings=settings,
@@ -1223,6 +1363,7 @@ class AutoSwitchEngine:
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models, self._windows)
+            policy = self._policy_headroom_map(usage, headroom)
             active_headroom = headroom.get(current)
             decided_now = self.clock()
             ordered, any_known, active_reset_ts = _rank(
@@ -1231,6 +1372,7 @@ class AutoSwitchEngine:
                 oauth_candidates=oauth_candidates,
                 usage=usage,
                 headroom=headroom,
+                policy=policy,
                 current=current,
                 active_headroom=active_headroom,
                 settings=settings,
@@ -1327,7 +1469,10 @@ class AutoSwitchEngine:
         # consume-first that is the phase-2 refetch, not the stale one.
         left_snapshot = (
             active_headroom,
-            _binding_recovery_ts(usage.get(current), self._models, decided_now, self._windows),
+            _binding_recovery_ts(
+                usage.get(current), self._models, decided_now, self._windows,
+                self._active_gates(),
+            ),
         )
         transient_failure = False
         systemic = ""
@@ -1410,6 +1555,7 @@ class AutoSwitchEngine:
         recovered: bool,
         settings: AutoSwitchSettings,
         current: str | None = None,
+        usage: dict[str, dict | str | None] | None = None,
     ) -> str | None:
         """The account this engine most recently left, while it is still barred.
 
@@ -1513,7 +1659,9 @@ class AutoSwitchEngine:
                     return None               # beats us outright; not a flip
             elif (
                 settings is not None
-                and left_headroom > 100.0 - settings.threshold
+                and self._clears_gates(
+                    (usage or {}).get(barred), left_headroom, settings.threshold
+                )
             ):
                 # An unreadable active must not be silently scored as "the
                 # peer does not beat it" -- same landing-eligible fallback
@@ -1689,13 +1837,15 @@ class AutoSwitchEngine:
             # when a nearer window starts binding, never as a side effect
             # of the active spending down -- the failure mode a bare
             # dominance leg has, guarded directly in the mutation table.
-            if h is not None and h > 100.0 - settings.threshold:
+            if self._clears_gates(usage.get(barred), h, settings.threshold):
                 return True
             peer_recovery_ts = _binding_recovery_ts(
-                usage.get(barred), self._models, now, self._windows
+                usage.get(barred), self._models, now, self._windows,
+                self._active_gates(),
             )
             active_recovery_ts = _binding_recovery_ts(
-                usage.get(current), self._models, now, self._windows
+                usage.get(current), self._models, now, self._windows,
+                self._active_gates(),
             )
             # The active's recovery must be a REAL measurement, not merely
             # "larger" -- `_binding_recovery_ts` returns `inf` for both
@@ -1759,7 +1909,7 @@ class AutoSwitchEngine:
             if active_headroom is not None:
                 if h > active_headroom * HORIZON_HEADROOM_RATIO + SPENT_HEADROOM_PCT:
                     return True
-            elif h > 100.0 - settings.threshold:
+            elif self._clears_gates(usage.get(barred), h, settings.threshold):
                 return True
         if (
             isinstance(left_headroom, (int, float))
@@ -1772,7 +1922,10 @@ class AutoSwitchEngine:
         # schedule around. Moving off it onto a real reset IS the improvement.
         was = left_recovery if isinstance(left_recovery, (int, float)) else float("inf")
         return (
-            _binding_recovery_ts(usage.get(barred), self._models, now, self._windows)
+            _binding_recovery_ts(
+                usage.get(barred), self._models, now, self._windows,
+                self._active_gates(),
+            )
             < was - RECOVERY_HYSTERESIS_S
         )
 
@@ -1785,6 +1938,7 @@ class AutoSwitchEngine:
         no_return: str | None,
         usage: dict[str, dict | str | None],
         headroom: dict[str, float | None],
+        policy: dict[str, float | None] | None = None,
         current: str,
         active_headroom: float | None,
         settings: AutoSwitchSettings,
@@ -1814,8 +1968,16 @@ class AutoSwitchEngine:
         # account is at/over the threshold, so a single healthy peer still
         # wins the normal way, and RECOVERY_HYSTERESIS_S below replaces the
         # percentage-point margin so two accounts in the 90s cannot ping-pong.
+        # `policy` is decision headroom: equal to `headroom` when every gate
+        # shares settings.threshold, and shifted by per-gate slack otherwise.
+        # Threshold, landing, and the best-strategy hysteresis key on it.
+        # Absolute `headroom` stays the unit of "really out of quota" (h <= 0,
+        # the spent band, the recovery ratio).
+        if policy is None:
+            policy = headroom
+        active_policy = policy.get(current)
         all_above = _every_account_above_threshold(
-            oauth_candidates, headroom, active_headroom, settings.threshold
+            oauth_candidates, policy, active_policy, settings.threshold
         )
         # "Is anything worth having?" — the most headroom any candidate with a
         # READABLE row offers. Two exclusions and no others:
@@ -1842,7 +2004,10 @@ class AutoSwitchEngine:
             default=0.0,
         )
         active_recovery_ts = (
-            _binding_recovery_ts(usage.get(current), self._models, now, self._windows)
+            _binding_recovery_ts(
+                usage.get(current), self._models, now, self._windows,
+                self._active_gates(),
+            )
             if all_above
             else 0.0  # unread unless all_above; never a live sentinel
         )
@@ -1854,6 +2019,10 @@ class AutoSwitchEngine:
             h = headroom.get(num)
             if h is None:
                 continue
+            # Same number as `h` when gates share one threshold.
+            p = policy.get(num)
+            if p is None:
+                p = h
             any_known = True          # it EXISTS and is readable either way
             if h <= 0:
                 continue  # itself at its limit — never a target
@@ -1863,7 +2032,10 @@ class AutoSwitchEngine:
                 _seven_day_reset_ts(usage.get(num), now) if consume_first else None
             )
             recovery_ts = (
-                _binding_recovery_ts(usage.get(num), self._models, now, self._windows)
+                _binding_recovery_ts(
+                    usage.get(num), self._models, now, self._windows,
+                    self._active_gates(),
+                )
                 if all_above
                 else 0.0
             )
@@ -1872,7 +2044,7 @@ class AutoSwitchEngine:
                 # would re-trigger on the very next tick. At-limit and failover
                 # are escapes that skip this whole block — any account with real
                 # headroom beats a blocked or dead one.
-                if (100.0 - h) >= settings.threshold and not all_above:
+                if (100.0 - p) >= settings.threshold and not all_above:
                     continue
                 if all_above:
                     # Checked before the strategies, because with nothing below
@@ -1931,11 +2103,14 @@ class AutoSwitchEngine:
                         or reset_ts >= active_reset_ts
                     ):
                         continue
-                elif active_headroom is not None:
+                elif active_policy is not None:
                     # best: the candidate must beat the active account by the
                     # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    # qualifies; near-line pairs can't flap back). On the
+                    # policy scale that margin is slack-to-the-nearest-gate,
+                    # which equals raw headroom when every gate shares one
+                    # threshold.
+                    if p - active_policy < settings.hysteresis_pct:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two
@@ -1964,10 +2139,11 @@ class AutoSwitchEngine:
                 )
             elif consume_first:
                 # Soonest weekly reset first (unknown resets sort last), most
-                # headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -h)
+                # slack before the next gate breaks ties, then sequence order.
+                # `p` equals raw headroom when gates share one threshold.
+                key = (reset_ts if reset_ts is not None else float("inf"), -p)
             else:
-                key = (-h,)
+                key = (-p,)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
@@ -2085,12 +2261,23 @@ class AutoSwitchEngine:
         # decides on the same value even if apply_threshold() lands mid-tick.
         if threshold is None:
             threshold = self.settings.threshold
-        escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
-            or (
+        gates = self._active_gates()
+        if gates.overrides:
+            policy_headroom = self._policy_headroom_value(
+                active_value if isinstance(active_value, dict) else None, gates
+            )
+            near_threshold = (
+                policy_headroom is not None
+                and 100.0 - policy_headroom >= threshold - ESCALATION_MARGIN_PCT
+            )
+        else:
+            near_threshold = (
                 active_headroom is not None
                 and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
             )
+        escalate = bool(candidates) and (
+            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
+            or near_threshold
         )
         if escalate:
             escalation_fetch = {current, *candidates}
@@ -2244,9 +2431,9 @@ class AutoSwitchEngine:
             self._emit(
                 ConfigWarningEvent(
                     message=(
-                        f"autoswitch.model: {', '.join(missing)} matches no "
-                        "account's usage windows — only the 5h/7d limits are "
-                        "being watched for it (typo?)"
+                        f"{', '.join(missing)} matches no account's per-model "
+                        "window — that gate is not being watched (typo in "
+                        "autoswitch.model or autoswitch.modelThresholds?)"
                     )
                 )
             )
@@ -2305,13 +2492,134 @@ class AutoSwitchEngine:
         """Cut the current inter-tick sleep short and tick now."""
         self._wake.set()
 
+    def _pin_poll_inputs(self) -> None:
+        gates = gate_thresholds(self.settings)
+        self.switcher.set_poll_policy_inputs(
+            self.settings.threshold,
+            effective_model_names(self.settings),
+            self._windows,
+            gate_thresholds=gates.overrides or None,
+        )
+
+    def _active_gates(self) -> GateThresholds:
+        """Gates for the tick in progress, else the live settings.
+
+        ``_tick_inner`` snapshots these from the settings object it captured,
+        so a TUI ``apply_threshold`` mid-fetch cannot move the decision and
+        the escalation check onto different numbers.
+        """
+        gates = getattr(self, "_decision_gates", None)
+        if gates is not None:
+            return gates
+        settings = getattr(self, "settings", None)
+        if isinstance(settings, AutoSwitchSettings):
+            return gate_thresholds(settings)
+        # Direct unit calls build a bare stand-in with only ``_models``.
+        return gate_thresholds(AutoSwitchSettings())
+
+    def _policy_headroom_value(
+        self,
+        usage: dict | str | None,
+        gates: GateThresholds | None = None,
+    ) -> float | None:
+        """Headroom on the shared-threshold scale.
+
+        With no per-gate overrides this is ``account_headroom`` itself, so
+        every comparison that already keys on ``100 - headroom`` vs
+        ``settings.threshold`` is unchanged. With overrides it is
+        ``(100 - threshold) + slack``, where slack is the distance to the
+        nearest gate: it drops to ``100 - threshold`` exactly when any gate
+        trips, and differences of it are differences of slack (the hysteresis
+        unit).
+        """
+        gates = self._active_gates() if gates is None else gates
+        raw = usage if isinstance(usage, dict) else None
+        if not gates.overrides:
+            return oauth.account_headroom(raw, self._models, self._windows)
+        windows = oauth.relevant_windows(raw, self._models, self._windows)
+        if not windows:
+            return None
+        label, pct, _resets_at = min(
+            windows,
+            key=lambda w: (gates.for_label(w[0]) - w[1], -w[1]),
+        )
+        shift = gates.default - gates.for_label(label)
+        return (100.0 - pct) - shift
+
+    def _policy_headroom_map(
+        self,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+    ) -> dict[str, float | None]:
+        """Per-account decision headroom. The absolute map when every gate
+        shares ``threshold`` (same object, so ranking cannot drift)."""
+        if not self._active_gates().overrides:
+            return headroom
+        return {
+            num: self._policy_headroom_value(value if isinstance(value, dict) else None)
+            for num, value in usage.items()
+        }
+
+    def _below_threshold_detail(self, usage_value, absolute_headroom: float) -> str:
+        """``"50% < 90%"`` when gates share one threshold (the historical
+        text); otherwise the tightest gate, ``"Fable 35% < 40%"``."""
+        gates = self._active_gates()
+        if not gates.overrides:
+            return (
+                f"{pct_label(100.0 - absolute_headroom)}% < "
+                f"{pct_label(gates.default)}%"
+            )
+        windows = oauth.relevant_windows(
+            usage_value if isinstance(usage_value, dict) else None,
+            self._models,
+            self._windows,
+        )
+        label, pct, _resets_at = min(
+            windows,
+            key=lambda w: (gates.for_label(w[0]) - w[1], -w[1]),
+        )
+        return (
+            f"{label} {pct_label(pct)}% < "
+            f"{pct_label(gates.for_label(label))}%"
+        )
+
+    def _clears_gates(
+        self,
+        usage_value,
+        absolute_headroom: float | None,
+        threshold: float | None = None,
+    ) -> bool:
+        """Would ranking accept this account as a healthy landing spot?
+
+        The complement of "any gate has tripped". With no overrides this is
+        ``headroom > 100 - threshold``, the check the recovery release
+        already used. ``threshold`` is the tick's snapshotted shared threshold;
+        it matches ``_active_gates().default``.
+        """
+        if absolute_headroom is None:
+            return False
+        gates = self._active_gates()
+        limit = gates.default if threshold is None else threshold
+        if not gates.overrides:
+            return absolute_headroom > 100.0 - limit
+        policy = self._policy_headroom_value(usage_value)
+        return policy is not None and policy > 100.0 - limit
+
     def apply_threshold(self, threshold: float) -> None:
         """Session override from the TUI: retarget the trigger and poll
-        cadence mid-run. Threshold only — the model axes (and their derived
-        state) are fixed at construction. The frozen-settings swap is atomic
-        and each tick snapshots ``self.settings`` once, so no locking."""
+        cadence mid-run. Gates that inherit ``threshold``
+        follow it; an explicit 5h/7d/model threshold does not. The
+        frozen-settings swap is atomic and each tick snapshots
+        ``self.settings`` once, so no locking."""
         self.settings = replace(self.settings, threshold=threshold)
-        self.switcher.set_poll_policy_inputs(threshold, self._models, self._windows)
+        self._pin_poll_inputs()
+
+    def apply_gates(self, settings: AutoSwitchSettings) -> None:
+        """TUI gate edit (5h, weekly, per-model). Poll cadence follows now;
+        decisions, including a newly gated model's window, from the next
+        tick."""
+        self.settings = settings
+        self._pin_poll_inputs()
 
     def _next_delay(self, outcome: TickOutcome) -> float:
         interval = self.settings.interval_seconds

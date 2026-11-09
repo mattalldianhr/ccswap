@@ -531,6 +531,36 @@ def test_fetch_usage_explains_expired_or_unauthorized_credentials(monkeypatch):
         raise AssertionError("expected a Codex usage error")
 
 
+def test_fetch_usage_wraps_timeout(monkeypatch):
+    def urlopen(request, *, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+
+    try:
+        codex_usage.fetch_codex_usage(_auth())
+    except codex_usage.CodexUsageError as exc:
+        assert str(exc) == "Codex usage request failed: timed out"
+    else:
+        raise AssertionError("expected a Codex usage error")
+
+
+def test_refresh_auth_wraps_timeout(monkeypatch):
+    def urlopen(request, *, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+    auth = _auth()
+    auth["tokens"]["refresh_token"] = "old-refresh"
+
+    try:
+        codex_usage.refresh_codex_auth(auth)
+    except codex_usage.CodexUsageError as exc:
+        assert str(exc) == "Codex token refresh failed: timed out"
+    else:
+        raise AssertionError("expected a Codex usage error")
+
+
 def test_refresh_auth_uses_codex_refresh_contract_and_rotates_tokens(monkeypatch):
     requested = {}
 
@@ -589,3 +619,94 @@ def test_refresh_auth_uses_codex_refresh_contract_and_rotates_tokens(monkeypatch
         "id_token": "new-id",
     }
     assert auth["tokens"]["refresh_token"] == "old-refresh"
+
+
+def test_consume_paths_body_headers_and_optional_card(monkeypatch):
+    import io
+    for base, path in (
+        ("https://chatgpt.com/backend-api", "/wham/"),
+        ("https://example.test", "/api/codex/"),
+    ):
+        for card in (None, "card-1"):
+            def urlopen(request, *, timeout):
+                assert request.full_url == base + path + "rate-limit-reset-credits/consume"
+                assert request.method == "POST"
+                body = json.loads(request.data)
+                expected = {"redeem_request_id": "same-key"}
+                if card is not None:
+                    expected["credit_id"] = card
+                assert body == expected
+                assert request.get_header("Openai-beta") == "codex-1"
+                assert request.get_header("Content-type") == "application/json"
+                return io.BytesIO(b'{"code":"reset"}')
+            monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+            assert codex_usage.consume_reset_credit(
+                _auth(), base_url=base, redeem_request_id="same-key", credit_id=card
+            ) == {"code": "reset"}
+
+
+def test_list_reset_cards_sorted(monkeypatch):
+    import io
+    monkeypatch.setattr(codex_usage.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(
+        json.dumps({"credits": [
+            {"id": "undated", "status": "available", "expires_at": None},
+            {"id": "late", "status": "available", "expires_at": "2027-01-01Z"},
+            {"id": "early", "status": "available", "expires_at": "2026-12-01T00:00:00Z"},
+            {"id": "used", "status": "redeemed"},
+        ]}).encode()
+    ))
+    cards = codex_usage.list_reset_credits(_auth(), base_url="https://example.test")
+    assert [card["id"] for card in cards] == ["early", "late", "undated"]
+
+
+def test_consume_uncertain_errors_are_not_retried(monkeypatch):
+    import urllib.error
+    import pytest
+    for failure in (urllib.error.HTTPError("url", 500, "error", {}, None), TimeoutError()):
+        calls = []
+        def fail(*args, **kwargs):
+            calls.append(args)
+            raise failure
+        monkeypatch.setattr(codex_usage.urllib.request, "urlopen", fail)
+        with pytest.raises(codex_usage.CodexUsageError, match="outcome is unknown") as exc:
+            codex_usage.consume_reset_credit(
+                _auth(), base_url="https://example.test", redeem_request_id="key"
+            )
+        assert len(calls) == 1
+        if isinstance(failure, TimeoutError):
+            assert "unknown (" in str(exc.value)
+
+
+def test_reset_response_http_exceptions(monkeypatch):
+    import http.client
+
+    import pytest
+
+    for failure in (http.client.IncompleteRead(b"partial"), http.client.BadStatusLine("bad")):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                raise failure
+
+        calls = []
+
+        def urlopen(*args, **kwargs):
+            calls.append(1)
+            return Response()
+
+        monkeypatch.setattr(codex_usage.urllib.request, "urlopen", urlopen)
+        with pytest.raises(codex_usage.CodexUsageError, match="outcome is unknown") as exc:
+            codex_usage.consume_reset_credit(
+                _auth(), base_url="https://example.test", redeem_request_id="key"
+            )
+        assert "Check before retrying: another attempt may spend a second card." in str(
+            exc.value
+        )
+        assert len(calls) == 1
+        assert codex_usage.list_reset_credits(_auth(), base_url="https://example.test") == []
+        assert len(calls) == 2

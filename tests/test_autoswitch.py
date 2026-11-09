@@ -7,6 +7,7 @@ import os
 import threading
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -496,6 +497,104 @@ class TestDecisionTable:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "failover"
         assert harness.active_number() == 2
+
+    def test_unhealthy_count_survives_a_fresh_engine_per_tick(self, harness):
+        # `auto --once` builds a new engine every invocation.
+        usage = {"1": None, "2": _usage(10), "3": _usage(50)}
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert harness.state()["unhealthyTicks"] == 1
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_idle_hold_clock_survives_a_fresh_engine_per_tick(self, harness):
+        held = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(20)}
+        harness.tick_with_usage(held)
+        harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(held) is TickOutcome.NO_ACTION
+        assert harness.state()["unhealthyTicks"] == 1
+        assert not any(
+            isinstance(e, NoSwitchEvent) and e.reason == "active-idle"
+            for e in harness.events[-2:]
+        )
+
+    def test_persisted_count_ignored_for_another_account_or_stale_tick(self, harness):
+        unknown = {"1": None, "2": _usage(10), "3": _usage(50)}
+        harness.tick_with_usage(unknown)
+        harness.tick_with_usage(unknown)
+        assert harness.state()["unhealthyTicks"] == 2
+        harness.clock.advance(2 * IDLE_HOLD_MAX_S + 1)
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.state()["unhealthyTicks"] == 1
+        harness.engine._mutate_state(lambda s: s.update(healthAccount="2"))
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.state()["unhealthyTicks"] == 1
+
+    def test_count_built_on_one_account_is_not_saved_under_the_next(self, harness):
+        unknown = {"1": None, "2": None, "3": _usage(50)}
+        harness.tick_with_usage(unknown)
+        harness.tick_with_usage(unknown)
+        assert harness.state()["unhealthyTicks"] == 2
+        # Same engine, active account changes from 1 to 2 (e.g. by hand).
+        harness.make_live("b@example.com", 2)
+        assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        state = harness.state()
+        assert state["healthAccount"] == "2"
+        assert state["unhealthyTicks"] == 1
+        harness.engine = harness._make_engine()
+        assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.state()["unhealthyTicks"] == 2
+
+    def test_no_active_tick_keeps_the_health_context(self, harness):
+        unknown = {"1": None, "2": _usage(10), "3": _usage(50)}
+        harness.tick_with_usage(unknown)
+        harness.tick_with_usage(unknown)
+        with patch.object(
+            harness.switcher, "current_account_number", return_value=None
+        ):
+            harness.tick_with_usage(unknown)
+        assert harness.engine._health_account == "1"
+        assert harness.tick_with_usage(unknown) is TickOutcome.SWITCHED
+
+    def test_dry_run_loop_reaches_would_failover_on_unknown_usage(self, harness):
+        harness.engine = harness._make_engine(dry_run=True)
+        unknown = {"1": None, "2": _usage(10), "3": _usage(50)}
+        for _ in range(2):
+            assert harness.tick_with_usage(unknown) is TickOutcome.NO_ACTION
+        assert harness.tick_with_usage(unknown) is TickOutcome.SWITCHED
+        assert harness.active_number() == 1
+        assert "unhealthyTicks" not in harness.state()
+
+    def test_dry_run_idle_hold_clock_survives_ticks(self, harness):
+        harness.engine = harness._make_engine(dry_run=True)
+        held = {"1": USAGE_TOKEN_EXPIRED, "2": _usage(10), "3": _usage(20)}
+        harness.tick_with_usage(held)
+        harness.clock.advance(IDLE_HOLD_MAX_S + 1)
+        assert harness.tick_with_usage(held) is TickOutcome.NO_ACTION
+        assert not any(
+            isinstance(e, NoSwitchEvent) and e.reason == "active-idle"
+            for e in harness.events[-2:]
+        )
+
+    def test_loop_progress_survives_a_long_gap_between_ticks(self, harness):
+        unknown = {"1": None, "2": _usage(10), "3": _usage(50)}
+        harness.tick_with_usage(unknown)
+        harness.tick_with_usage(unknown)
+        harness.clock.advance(3 * IDLE_HOLD_MAX_S)
+        assert harness.tick_with_usage(unknown) is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+
+    def test_healthy_reading_clears_persisted_counters(self, harness):
+        harness.tick_with_usage({"1": None, "2": _usage(10), "3": _usage(10)})
+        harness.tick_with_usage({"1": _usage(50), "2": _usage(10), "3": _usage(10)})
+        state = harness.state()
+        assert "unhealthyTicks" not in state
+        assert "idleHoldSince" not in state
 
     def test_known_active_usage_resets_unhealthy_counter(self, harness):
         unknown = {"1": None, "2": _usage(10), "3": _usage(10)}
@@ -1763,6 +1862,71 @@ class TestAdaptiveScheduler:
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
 
+    def test_sentinel_slot_does_not_starve_the_other_alternates(
+        self, temp_home, monkeypatch
+    ):
+        """A live session's refused credential makes #2 a fetch-path sentinel
+        every tick (stamped, no request). A sentinel record moves none of
+        the staleness the picker used to key on, so #2 was the stalest due
+        row forever and #3 never got the one alternate poll per tick. The
+        picker keys on the last attempt instead, which reserve() stamps on
+        every claim, so the no-op pick rotates to the back of the queue and
+        the healthy alternate is polled when due."""
+        import time
+
+        h = self._harness(temp_home, monkeypatch)
+        session_creds = json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "sk-session-2",
+                "refreshToken": "rt-session-2",
+                "expiresAt": int((time.time() + 7200) * 1000),
+            },
+        })
+        session_dir_2 = h.switcher._session_dir("2", "b@example.com")
+        monkeypatch.setattr(
+            h.switcher,
+            "_live_session_pids",
+            lambda num, email: [4242] if str(num) == "2" else [],
+        )
+        counts: dict[str, int] = {}
+        fetch_sets: list[set] = []
+        real_collect = h.switcher.usage_entries_by_account
+
+        def spying_collect(*args, **kwargs):
+            # Each tick first reads the store with fetch=set(); only the
+            # planned collections are of interest here.
+            if kwargs.get("fetch"):
+                fetch_sets.append(set(kwargs["fetch"]))
+            return real_collect(*args, **kwargs)
+
+        def network(num, email, creds, is_active=False, **kwargs):
+            counts[num] = counts.get(num, 0) + 1
+            if creds == session_creds:
+                return oauth.UsageOutcome(None, error="http-401")
+            return oauth.UsageOutcome(_usage(10))
+
+        with (
+            patch(
+                "claude_swap.session.read_session_credentials",
+                side_effect=lambda d: session_creds if d == session_dir_2 else None,
+            ),
+            patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=network),
+            patch.object(
+                h.switcher, "usage_entries_by_account", side_effect=spying_collect
+            ),
+        ):
+            for _ in range(8):  # t0 .. t420
+                assert h.engine.tick() is TickOutcome.NO_ACTION
+                h.clock.advance(60)
+        # The refused credential drew exactly one request, then its stamp held.
+        assert counts["2"] == 1
+        # The healthy alternate was polled (first at t60, again once due).
+        assert counts.get("3", 0) >= 1
+        # An idle tick still re-derives the stamped slot at zero request cost,
+        # so a rotated credential is noticed on the next tick, not minutes later.
+        assert fetch_sets[:3] == [{"1", "2"}, {"3"}, {"2"}]  # t0, t60, t120
+
+
 
 class TestApiKeyAccounts:
     def _mark_api_key(self, harness, num: int) -> None:
@@ -2081,6 +2245,31 @@ class TestEventsShape:
         # Others show per-window pcts, not just the ambiguous binding pct.
         assert "#2: 5h 10% · 7d 0%" in line
         assert "#3: ?" in line
+
+    def test_poll_event_labels_active_windows_after_switch(self, temp_home):
+        h = EngineHarness(temp_home, threshold=96.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.make_live("a@example.com", 1)
+
+        assert h.tick_with_usage({
+            "1": _usage(98),
+            "2": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 49.0}},
+        }) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+        h.events.clear()
+        assert h.tick_with_usage({
+            "1": {"five_hour": {"pct": 0.0}, "seven_day": {"pct": 49.0}},
+            "2": {"five_hour": {"pct": 41.0}, "seven_day": {"pct": 60.0}},
+        }) is TickOutcome.NO_ACTION
+        poll = next(e for e in h.events if isinstance(e, PollEvent))
+        assert "Account-2 (b@example.com): 60% used [5h 41% · 7d 60%]" in poll.human()
+        assert "#1: 5h 0% · 7d 49%" in poll.human()
+        assert poll.to_json()["windowsPct"]["2"] == {"5h": 41.0, "7d": 60.0}
+        assert [e.reason for e in h.events if isinstance(e, NoSwitchEvent)] == [
+            "below-threshold"
+        ]
 
     def test_poll_event_windows_match_the_decision_set(self, temp_home):
         # Scoped windows appear only when configured: rendering an ignored
@@ -6839,29 +7028,22 @@ class TestFreshenRoutesThroughGate:
             "transient bucket and reads as (network?)"
         )
 
-    def test_unreadable_stash_is_not_reported_as_network_trouble(
-        self, temp_home
+    @pytest.mark.parametrize("kind", ["stash-unreadable", "session-unreadable"])
+    def test_unreadable_state_is_not_reported_as_network_trouble(
+        self, temp_home, kind
     ):
-        """A permanently unreadable stash row is local and needs a human.
-
-        The row is the sole copy of a generation the slot already consumed, so
-        the gate defers on every pass — correctly, since nothing on disk tells
-        a keychain locked for a minute from one locked forever. But an
-        unrecognised kind maps to "transient", and the tick then renders
-        "could not freshen any candidate (network?)" forever, on a condition
-        no network change can affect and only the operator can clear.
-        """
+        """Unreadable local state needs repair, rather than network retries."""
         from claude_swap import oauth as oauth_mod
 
         harness = EngineHarness(temp_home)
         harness.seed(2, "b@example.com", expires_at=1)
         with patch.object(
             harness.switcher, "consume_backup_grant",
-            return_value=oauth_mod.RefreshOutcome(None, "stash-unreadable"),
+            return_value=oauth_mod.RefreshOutcome(None, kind),
         ):
             status = harness.engine._freshen_target("2", "b@example.com")
-        assert status == "stash-unreadable", (
-            f"got {status!r}: an unreadable stash row falls into the "
+        assert status == kind, (
+            f"got {status!r}: unreadable local state falls into the "
             "transient bucket and reads as (network?)"
         )
 
@@ -6878,8 +7060,12 @@ class TestFreshenRoutesThroughGate:
             status = harness.engine._freshen_target("2", "b@example.com")
         assert status == "store-unmirrored"
 
+    @pytest.mark.parametrize("kind,remedy", [
+        ("store-unmirrored", "CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        ("session-unreadable", "Restore access"),
+    ])
     def test_an_actionable_cause_is_not_hidden_by_a_self_clearing_one(
-        self, temp_home
+        self, temp_home, kind, remedy
     ):
         """The tick reports ONE systemic cause, and it must be the actionable one.
 
@@ -6898,7 +7084,7 @@ class TestFreshenRoutesThroughGate:
 
         # Slot 2 needs a human (an env var is set); slot 3 clears itself.
         def by_slot(num, email, *a, **kw):
-            return "store-unmirrored" if num == "2" else "consume-busy"
+            return kind if num == "2" else "consume-busy"
 
         with patch.object(
             h.engine, "_freshen_target", side_effect=by_slot
@@ -6912,7 +7098,7 @@ class TestFreshenRoutesThroughGate:
         errors = [e for e in h.events if getattr(e, "message", None)]
         assert errors, f"no error event; got kinds {h.kinds()}"
         msg = errors[-1].message
-        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in msg, (
+        assert remedy in msg, (
             f"got {msg!r}: the self-clearing cause hid the one needing a human"
         )
 
@@ -6958,4 +7144,209 @@ class TestFreshenRoutesThroughGate:
         assert verdict == "ok"
         assert gate_calls["args"][0] == "2"
         assert "called" not in direct, "freshen must not POST outside the gate"
+
+
+def _windows(five_h: float, seven_d: float, fable: float | None = None) -> dict:
+    usage: dict = {"five_hour": {"pct": five_h}, "seven_day": {"pct": seven_d}}
+    if fable is not None:
+        usage["scoped"] = [{"name": "Fable", "pct": fable}]
+    return usage
+
+
+class TestPerGateThresholds:
+    """5h, weekly, and Fable each have their own wall. Any one trips a switch."""
+
+    def _seed(self, temp_home: Path, **kw) -> EngineHarness:
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        return h
+
+    def test_weekly_gate_trips_below_the_shared_threshold(self, temp_home):
+        h = self._seed(temp_home, threshold_7d=60.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 70),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_a_high_weekly_reading_holds_when_its_gate_is_higher(self, temp_home):
+        # 7d at 96% would trip the shared 90% line. Its own gate is 99, and
+        # 5h at 92 is under its own 95, so this account stays.
+        h = self._seed(temp_home, threshold_5h=95.0, threshold_7d=99.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(92, 96),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert reasons == ["below-threshold"]
+
+    def test_weekly_threshold_alias_sets_the_weekly_gate(self, temp_home):
+        h = self._seed(temp_home, weekly_threshold=60.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 70),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_threshold_7d_outranks_the_weekly_threshold_alias(self, temp_home):
+        # weeklyThreshold 99 alone would hold 7d at 96; threshold7d 95 wins.
+        h = self._seed(
+            temp_home, threshold_5h=95.0, weekly_threshold=99.0, threshold_7d=95.0
+        )
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 96),
+            "2": _windows(10, 10),
+            "3": _windows(20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+
+    def test_weekly_threshold_alias_covers_model_windows(self, temp_home):
+        h = self._seed(temp_home, model="Fable", weekly_threshold=60.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(5, 5, 65),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_model_threshold_outranks_the_weekly_threshold_alias(self, temp_home):
+        h = self._seed(
+            temp_home, model="Fable", weekly_threshold=60.0, model_thresholds="Fable=70"
+        )
+        outcome = h.tick_with_usage({
+            "1": _windows(5, 5, 65),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+
+    def test_fable_gate_trips_without_autoswitch_model(self, temp_home):
+        h = self._seed(temp_home, model_thresholds="Fable=40")
+        outcome = h.tick_with_usage({
+            "1": _windows(5, 5, 45),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        reasons = [e for e in h.events if isinstance(e, NoSwitchEvent)]
+        assert not any(e.reason == "below-threshold" for e in reasons)
+
+    def test_fable_gate_added_mid_run_is_watched_next_tick(self, temp_home):
+        # The TUI's t popup saves Fable=40 while the engine runs. Fable is not
+        # in autoswitch.model, so the engine must start reading its window.
+        h = self._seed(temp_home)
+        usage = {
+            "1": _windows(5, 5, 45),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        }
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        h.engine.apply_gates(replace(h.engine.settings, model_thresholds="Fable=40"))
+        assert h.switcher._poll_policy_inputs()[1] == ("Fable",)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+
+    def test_fable_under_its_own_gate_does_not_trip_the_shared_line(self, temp_home):
+        h = self._seed(temp_home, model="Fable", model_thresholds="Fable=95")
+        outcome = h.tick_with_usage({
+            "1": _windows(10, 10, 92),
+            "2": _windows(5, 5, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        detail = next(e.detail for e in h.events if isinstance(e, NoSwitchEvent))
+        assert detail == "Fable 92% < 95%"
+
+    @pytest.mark.parametrize("active", [
+        _windows(85, 10, 10),  # 5h
+        _windows(10, 75, 10),  # weekly
+        _windows(10, 10, 55),  # Fable
+    ])
+    def test_each_gate_trips_on_its_own(self, temp_home, active):
+        h = self._seed(
+            temp_home, threshold_5h=80.0, threshold_7d=70.0, model_thresholds="Fable=50",
+        )
+        outcome = h.tick_with_usage({
+            "1": active,
+            "2": _windows(10, 10, 10),
+            "3": _windows(20, 20, 20),
+        })
+        assert outcome is TickOutcome.SWITCHED, active
+        assert h.active_number() == 2
+
+    def test_does_not_land_on_a_tripped_fable_gate(self, temp_home):
+        # Peer 2 has more raw headroom (max pct 45) but is over its Fable
+        # gate. Peer 3 is the one that is actually usable.
+        h = self._seed(temp_home, model_thresholds="Fable=40")
+        outcome = h.tick_with_usage({
+            "1": _windows(95, 10, 10),
+            "2": _windows(10, 10, 45),
+            "3": _windows(50, 50, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_ranks_by_slack_to_the_nearest_gate(self, temp_home):
+        # Peer 2 wins on raw headroom (max pct 45 → 55 left) but is 5 points
+        # from its weekly gate. Peer 3 has less raw headroom and 30 points
+        # of slack. The switch goes to 3.
+        h = self._seed(temp_home, threshold_7d=50.0)
+        outcome = h.tick_with_usage({
+            "1": _windows(95, 10),
+            "2": _windows(10, 45),
+            "3": _windows(60, 10),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+
+
+class TestOptionalWarmup:
+    def test_default_off_never_constructs_warmup(self, harness, monkeypatch):
+        monkeypatch.setattr("claude_swap.warmup.WarmupEngine", lambda *a: pytest.fail("warmup"))
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_enabled_warmup_receives_dry_run_and_reports_events(self, harness, monkeypatch, dry_run):
+        harness.engine.settings = replace(harness.engine.settings, warmup_five_hour=True)
+        harness.engine.dry_run = dry_run
+        calls = []
+
+        class FakeWarmup:
+            def __init__(self, switcher, clock, report, enabled):
+                assert enabled()
+                self.report = report
+
+            def tick(self, **kwargs):
+                calls.append(kwargs)
+                self.report("test warmup result")
+
+        monkeypatch.setattr("claude_swap.warmup.WarmupEngine", FakeWarmup)
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+        assert calls == [{"dry_run": dry_run}]
+        event = harness.events[-1]
+        assert event.kind == "warmup"
+        assert event.to_json()["message"] == "test warmup result"
+        assert event.human() == "test warmup result"
+
+    def test_warmup_failure_preserves_switch_result(self, harness, monkeypatch):
+        harness.engine.settings = replace(harness.engine.settings, warmup_five_hour=True)
+        harness.engine._warmup = SimpleNamespace(tick=lambda **kwargs: 1 / 0)
+        monkeypatch.setattr(harness.engine, "_tick_inner", lambda: TickOutcome.NO_ACTION)
+        assert harness.engine.tick() == TickOutcome.NO_ACTION
+        assert harness.events[-1].kind == "warmup"
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import math
 import urllib.error
@@ -357,7 +358,9 @@ def fetch_codex_usage(
             f"Codex usage request failed ({exc.code})", status_code=exc.code
         ) from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise CodexUsageError(f"Codex usage request failed: {exc.reason}") from exc
+        raise CodexUsageError(
+            f"Codex usage request failed: {getattr(exc, 'reason', exc)}"
+        ) from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexUsageError(f"Could not decode Codex usage response: {exc}") from exc
     usage = _convert_payload(payload)
@@ -385,6 +388,73 @@ def fetch_codex_usage(
         ):
             pass
     return usage
+
+
+def list_reset_credits(
+    auth: dict[str, Any], *, base_url: str, timeout: float = 10.0
+) -> list[dict[str, Any]]:
+    """Return available cards, ordered by expiry (undated cards last)."""
+    headers = _headers(auth)
+    headers["OpenAI-Beta"] = "codex-1"
+    request = urllib.request.Request(reset_credits_url(base_url), headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (
+        http.client.HTTPException, urllib.error.URLError, OSError,
+        UnicodeDecodeError, ValueError,
+    ):
+        return []
+    credits = payload.get("credits") if isinstance(payload, dict) else None
+    if not isinstance(credits, list):
+        return []
+    cards = [
+        {"id": card["id"], "expires_at": _iso_timestamp(card.get("expires_at"))}
+        for card in credits
+        if isinstance(card, dict) and card.get("status") == "available"
+        and isinstance(card.get("id"), str) and card["id"]
+    ]
+    return sorted(cards, key=lambda card: card["expires_at"] or "9999")
+
+
+def consume_reset_credit(
+    auth: dict[str, Any], *, base_url: str, redeem_request_id: str,
+    credit_id: str | None = None, timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Explicitly redeem one reset card; never retry an uncertain request."""
+    headers = _headers(auth)
+    headers.update({"Content-Type": "application/json", "OpenAI-Beta": "codex-1"})
+    body = {"redeem_request_id": redeem_request_id}
+    if credit_id is not None:
+        body["credit_id"] = credit_id
+    request = urllib.request.Request(
+        reset_credits_url(base_url) + "/consume",
+        data=json.dumps(body).encode("utf-8"), headers=headers, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise CodexUsageError(
+            f"Reset outcome is unknown (HTTP {exc.code}); run 'ccswap codex usage' to check. "
+            "Check before retrying: another attempt may spend a second card.",
+            status_code=exc.code,
+        ) from exc
+    except (
+        http.client.HTTPException, urllib.error.URLError, OSError,
+        UnicodeDecodeError, ValueError,
+    ) as exc:
+        raise CodexUsageError(
+            f"Reset outcome is unknown ({getattr(exc, 'reason', exc)}); "
+            "run 'ccswap codex usage' to check. "
+            "Check before retrying: another attempt may spend a second card."
+        ) from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("code"), str):
+        raise CodexUsageError(
+            "Reset outcome is unknown; run 'ccswap codex usage' to check. "
+            "Check before retrying: another attempt may spend a second card."
+        )
+    return payload
 
 
 def refresh_codex_auth(
@@ -435,7 +505,9 @@ def refresh_codex_auth(
             f"Codex token refresh failed ({exc.code})", status_code=exc.code
         ) from exc
     except (urllib.error.URLError, OSError) as exc:
-        raise CodexUsageError(f"Codex token refresh failed: {exc.reason}") from exc
+        raise CodexUsageError(
+            f"Codex token refresh failed: {getattr(exc, 'reason', exc)}"
+        ) from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CodexUsageError(f"Could not decode Codex token refresh response: {exc}") from exc
 

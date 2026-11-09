@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 import logging
@@ -13,6 +14,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from stat import S_ISDIR
 
 from claude_swap import macos_keychain
 
@@ -44,6 +46,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.credentials import (  # noqa: F401  (constants re-exported for migrations/tests)
     CLAUDE_CODE_KEYCHAIN_SERVICE,
+    CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
@@ -51,7 +54,11 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     merge_shared_credential_fields,
     shared_credential_fields,
 )
-from claude_swap.fsutil import read_text_with_retry
+from claude_swap.fsutil import (
+    atomic_write_bytes,
+    atomic_write_text,
+    read_text_with_retry,
+)
 from claude_swap.locking import FileLock
 from claude_swap.logging_config import setup_logging
 from claude_swap.models import (
@@ -86,8 +93,10 @@ from claude_swap.paths import (
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
 from claude_swap.settings import (
+    effective_model_names,
+    gate_thresholds,
+    load_credential_settings,
     load_settings,
-    parse_model_names,
     parse_window_selection,
     settings_path,
 )
@@ -216,6 +225,9 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `ccswap unclaimed` inspects it"
     ),
+    "session-unreadable": (
+        "session state could not be read — restore access and retry"
+    ),
 }
 
 SENTINEL_NOTES = {
@@ -323,6 +335,15 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+def _oauth_login(text: str) -> dict | None:
+    """The ``claudeAiOauth`` payload of a credential string, or None for empty,
+    malformed or non-object JSON (``extract_oauth_data`` assumes an object)."""
+    try:
+        return oauth.extract_oauth_data(text)
+    except (ValueError, AttributeError):
+        return None
+
+
 
 
 
@@ -346,20 +367,32 @@ class ClaudeAccountSwitcher:
                 file=sys.stderr,
             )
 
+        # Read once per process. In explicit file mode the credential store must
+        # never probe the macOS Keychain, even if it becomes available later.
+        self.credential_backend: str = load_credential_settings(
+            self.backup_dir
+        ).backend
         self.sequence_file = self.backup_dir / "sequence.json"
         self.configs_dir = self.backup_dir / "configs"
         self.credentials_dir = self.backup_dir / "credentials"
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
-        # (settings mtime, (threshold, models, account_windows)) — see
-        # _poll_policy_inputs.
+        # (settings mtime, (threshold, models, account_windows, gate overrides))
+        # — see _load_poll_inputs. Gate overrides are lowercased label → pct
+        # for windows that do NOT inherit autoswitch.threshold.
         self._poll_inputs_cache: (
-            tuple[float | None, tuple[float, tuple[str, ...], tuple[str, ...]]] | None
+            tuple[
+                float | None,
+                tuple[float, tuple[str, ...], tuple[str, ...], dict[str, float]],
+            ]
+            | None
         ) = None
         self._poll_inputs_override: (
             tuple[float, tuple[str, ...], tuple[str, ...]] | None
         ) = None
+        # None = not pinned (read the file). {} = pinned, no per-gate overrides.
+        self._poll_gate_overrides: dict[str, float] | None = None
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
@@ -534,8 +567,8 @@ class ClaudeAccountSwitcher:
         MODE. `shutil.copy2` preserves the source mode. Measured on a 0644
         `~/.claude.json` holding `primaryApiKey`: the replacement got 0600 from
         `_write_json` and the salvage stayed 0644, so the secret ended up
-        world-readable in a file cswap created. Copied without metadata and
-        chmod'ed 0600 explicitly.
+        world-readable in a file cswap created. Written through
+        ``atomic_write_bytes``: 0600 from creation, never at the umask mode.
 
         COLLISION. The stamp is second-resolution and `copy2` onto an existing
         name overwrites. Two failed switches inside one second left ONE file —
@@ -564,9 +597,7 @@ class ClaudeAccountSwitcher:
             salvage = path.with_name(f"{stem}.{n}")
             n += 1
         try:
-            shutil.copy(path, salvage)          # NOT copy2: mode is set below
-            if sys.platform != "win32":
-                os.chmod(salvage, 0o600)
+            atomic_write_bytes(salvage, path.read_bytes())
         except OSError as e:
             raise SwitchError(
                 f"{path} could not be parsed and the salvage copy failed "
@@ -584,27 +615,22 @@ class ClaudeAccountSwitcher:
         return salvage
 
     def _write_json(self, path: Path, data: dict) -> None:
-        """Write JSON file with validation."""
-        content = json.dumps(data, indent=2)
+        """Write a JSON file atomically: 0600 temp beside the target, rename.
 
-        # Write to temp file first
-        temp_path = path.with_suffix(f".{os.getpid()}.tmp")
-        temp_path.write_text(content, encoding="utf-8")
-
-        # Validate written content
+        The mode goes on the temp, so the rename is the final commit and
+        nothing can fail after the file is published (a chmod on the final
+        path could raise with the write already live, making callers roll
+        back around committed metadata); a publish that fails removes the
+        temp instead of stranding it beside the target. ``allow_nan=False``:
+        ``json.dumps`` would happily emit ``NaN`` or ``Infinity``, which
+        Claude Code's ``JSON.parse`` rejects -- in ``~/.claude.json`` that is
+        a corrupted config, so it is refused here, before anything is written.
+        """
         try:
-            json.loads(temp_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            temp_path.unlink()
-            raise ConfigError("Generated invalid JSON")
-
-        # Permissions go on the temp file so the rename below is the final,
-        # atomic commit: nothing can fail after the file is published (a
-        # chmod on the final path could raise with the write already live,
-        # making callers roll back around committed metadata).
-        if sys.platform != "win32":
-            os.chmod(temp_path, 0o600)
-        shutil.move(str(temp_path), str(path))
+            content = json.dumps(data, indent=2, allow_nan=False)
+        except ValueError as e:
+            raise ConfigError(f"Generated invalid JSON: {e}")
+        atomic_write_text(path, content)
 
     # -- credential storage (delegates to CredentialStore) ----------------
     #
@@ -737,6 +763,7 @@ class ClaudeAccountSwitcher:
                 secure_env or str(get_default_claude_config_home()),
                 strict_keychain=True,
                 keychain_service=CLAUDE_CODE_KEYCHAIN_SERVICE if not secure_env else None,
+                use_keychain=self._store._keychain_platform(),
             )
             if creds:
                 return creds
@@ -751,7 +778,10 @@ class ClaudeAccountSwitcher:
         elif not config_dir:
             return self._refuse_degraded_capture()
         else:
-            creds = read_config_dir_credentials(config_dir, strict_keychain=True)
+            creds = read_config_dir_credentials(
+                config_dir, strict_keychain=True,
+                use_keychain=self._store._keychain_platform(),
+            )
             if creds:
                 return creds
             if _same_directory(Path(config_dir), get_default_claude_config_home()):
@@ -796,6 +826,156 @@ class ClaudeAccountSwitcher:
     def _backup_enc_path(self, account_num: str, email: str) -> Path:
         return self._store._backup_enc_path(account_num, email)
 
+    def _refuse_incomplete_file_backend(self) -> None:
+        """Refuse file mode when it would strand Keychain-only account backups,
+        or when Claude Code's live login is in a readable Keychain.
+
+        The setting takes effect in the next process, so the last safe point to
+        prove every managed account is available without Keychain is before the
+        config write. Missing ``sequence.json`` means there is no roster yet.
+
+        The live-login check covers the account that is active right now: where
+        Claude Code keeps rotating tokens in the Keychain, the plaintext file is
+        an older generation, and the first file-mode switch would back it up
+        over that account's good backup.
+        """
+        if self.platform != Platform.MACOS:
+            return
+        state, service = self._keychain_login_vs_file()
+        if state in ("keychain-newer", "differs"):
+            raise ConfigError(
+                f'Cannot set credentials.backend to file: Claude Code\'s login in '
+                f'the Keychain item "{service}" does not match '
+                f"{get_credentials_path()}, so that file is out of date. File "
+                "mode is for Macs where Claude Code runs only with the Keychain "
+                "locked (over SSH). If that is this Mac, delete the leftover "
+                f'item with `security delete-generic-password -s "{service}"`, '
+                "log in to Claude Code over SSH, and try again."
+            )
+        missing = self._accounts_without_file_backup()
+        if missing:
+            raise ConfigError(
+                "Cannot set credentials.backend to file: these managed accounts "
+                f"have no usable file backup: {', '.join(missing)}. Either remove "
+                "them (`ccswap remove <email>`), switch, then log in and "
+                "`ccswap add` each again; or, from a GUI terminal where the "
+                "Keychain is readable: `ccswap export <path>`, remove them, "
+                "`ccswap config set credentials.backend file`, then "
+                "`ccswap import <path>`."
+            )
+
+    def _refuse_leaving_file_backend(self) -> None:
+        """Refuse going back to ``auto`` when the Keychain holds another login.
+
+        ``auto`` reads the Keychain before the plaintext file, so an older
+        Keychain login would replace the one ccswap kept current in the file.
+        A newer Keychain login (e.g. settings.json edited by hand on a GUI Mac,
+        where nothing was written in file mode) is what ``auto`` should pick, so
+        that is allowed. A locked or unorderable Keychain only gets a warning,
+        since refusing could leave no way back.
+        """
+        if self.platform != Platform.MACOS or self.credential_backend != "file":
+            return
+        state, service = self._keychain_login_vs_file()
+        if state == "file-newer":
+            raise ConfigError(
+                f'Cannot leave the file backend: the Keychain item "{service}" '
+                f"holds a different login than {get_credentials_path()}, and "
+                "auto reads the Keychain first, so it would use that older "
+                f'login. Delete it with `security delete-generic-password -s '
+                f'"{service}"`, then try again.'
+            )
+        # keychain-newer is allowed but still warned: expiry order only means
+        # something within one account, and the Keychain may hold another one.
+        if state in ("unreadable", "differs", "keychain-newer"):
+            self._warn_residual_keychain_items()
+
+    def _require_file_backup(self, account_num: str) -> None:
+        """In file mode, refuse switching to an account whose backup exists only
+        in the Keychain. Covers a ``settings.json`` edited by hand, which skips
+        the ``config set`` check. Only the target is checked, so one bad slot
+        doesn't block switching between healthy ones; kept out of ``__init__``
+        so ``config set credentials.backend auto`` still works as the way back."""
+        if self.platform != Platform.MACOS or self.credential_backend != "file":
+            return
+        missing = self._accounts_without_file_backup({str(account_num)})
+        if missing:
+            raise ConfigError(
+                f"credentials.backend is file, but {missing[0]} has no usable file "
+                "backup. Run `ccswap config set credentials.backend auto` from a "
+                "GUI terminal, or remove and re-add the account."
+            )
+
+    def _keychain_login_vs_file(self) -> tuple[str, str]:
+        """Compare Claude Code's Keychain login with the plaintext credential file.
+
+        Returns ``(state, service)``: ``"unreadable"`` (locked or failing, so
+        Claude Code is using the file), ``"absent"``, ``"no-file"`` (Keychain
+        login but no OAuth login in the file, so nothing there to copy or
+        protect), ``"same"``, ``"keychain-newer"``, ``"file-newer"``, or
+        ``"differs"`` when the two can't be ordered. Calls the Keychain wrapper
+        directly so this probe never changes the credential store's view of
+        Keychain usability.
+        """
+        from claude_swap.credentials import _active_oauth_keychain_services
+
+        account = macos_keychain.keychain_account_name()
+        for service in _active_oauth_keychain_services():
+            try:
+                value = macos_keychain.get_password(service, account)
+            except macos_keychain.KEYCHAIN_ERRORS:
+                return "unreadable", service
+            if value:
+                try:
+                    text = get_credentials_path().read_text(encoding="utf-8")
+                except OSError:
+                    text = ""
+                file_login = _oauth_login(text)
+                if not file_login:
+                    return "no-file", service
+                keychain_login = _oauth_login(value)
+                if not keychain_login:
+                    return "differs", service  # not an OAuth login: can't compare
+                if oauth.credential_fingerprint(value) == oauth.credential_fingerprint(text):
+                    return "same", service
+                # A newer token generation expires later; that orders the two.
+                kc_exp = keychain_login.get("expiresAt")
+                file_exp = file_login.get("expiresAt")
+                if (
+                    isinstance(kc_exp, (int, float))
+                    and isinstance(file_exp, (int, float))
+                    and kc_exp != file_exp
+                ):
+                    return ("keychain-newer" if kc_exp > file_exp else "file-newer"), service
+                return "differs", service
+        return "absent", ""
+
+    def _accounts_without_file_backup(self, only: set[str] | None = None) -> list[str]:
+        """Emails of managed accounts (all, or just ``only``) whose ``.enc``
+        backup is missing or unusable."""
+        data = self._get_sequence_data()
+        if not data:
+            return []
+        missing: list[str] = []
+        for account_num, info in data.get("accounts", {}).items():
+            if only is not None and str(account_num) not in only:
+                continue
+            email = info.get("email", "")
+            backup = self._backup_enc_path(str(account_num), email)
+            # Decode exactly as the file-mode read will: a non-empty but corrupt
+            # .enc would pass a size check, then read as empty once the Keychain
+            # copy is no longer consulted.
+            try:
+                encoded = backup.read_text(encoding="utf-8").strip()
+                usable = bool(
+                    base64.b64decode(encoded, validate=True).decode("utf-8").strip()
+                )
+            except (OSError, ValueError):
+                usable = False
+            if not usable:
+                missing.append(email)
+        return missing
+
     def _write_backup_enc(self, account_num: str, email: str, credentials: str) -> None:
         self._store._write_backup_enc(account_num, email, credentials)
 
@@ -821,12 +1001,14 @@ class ClaudeAccountSwitcher:
         worse than the drift caveat — but gets a stale marker so setup_session
         re-bootstraps it once it is no longer live.
         """
-        if self._live_session_pids(account_num, email):
-            from claude_swap.session import mark_session_stale
+        from claude_swap.session import mark_session_stale, scan_live_sessions
 
-            if not mark_session_stale(self._session_dir(account_num, email)):
+        session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        if sessions or unreadable:
+            if not mark_session_stale(session_dir):
                 self._logger.error(
-                    "Account %s's backup credentials changed but its live "
+                    "Account %s's backup credentials changed but its live or unreadable "
                     "session profile could not be marked stale; it may keep "
                     "serving the superseded generation once it exits.",
                     account_num,
@@ -834,8 +1016,10 @@ class ClaudeAccountSwitcher:
         else:
             self._invalidate_session_credentials(account_num, email)
 
-    def _read_account_credentials(self, account_num: str, email: str) -> str:
-        return self._store._read_account_credentials(account_num, email)
+    def _read_account_credentials(
+        self, account_num: str, email: str, *, cached: bool = False
+    ) -> str:
+        return self._store._read_account_credentials(account_num, email, cached=cached)
 
     def _write_account_credentials(
         self, account_num: str, email: str, credentials: str
@@ -954,7 +1138,10 @@ class ClaudeAccountSwitcher:
         if not record:
             return False
         email = record.get("email", "")
-        if not self._read_account_credentials(str(account_num), email):
+        # Eligibility only (the snapshot's `switchable` flag, rotation
+        # candidates): served from the display read cache. Every activation
+        # path re-reads the backup fresh before using it.
+        if not self._read_account_credentials(str(account_num), email, cached=True):
             return False
         if not self._read_account_config(str(account_num), email):
             return False
@@ -965,9 +1152,8 @@ class ClaudeAccountSwitcher:
     ) -> None:
         """Write account config to backup."""
         config_file = self.configs_dir / f".claude-config-{account_num}-{email}.json"
-        config_file.write_text(config, encoding="utf-8")
-        if sys.platform != "win32":
-            os.chmod(config_file, 0o600)
+        # Atomic: a torn backup config is a broken future restore.
+        atomic_write_text(config_file, config)
 
     # -- public accessors for session mode (claude_swap.session) ---------
 
@@ -1290,7 +1476,8 @@ class ClaudeAccountSwitcher:
         """
         for path in staging.values():
             try:
-                path.unlink()
+                # missing_ok: a claim the create never reached holds nothing.
+                path.unlink(missing_ok=True)
             except OSError as e:
                 self._logger.error(f"Could not remove swap staging copy: {e}")
                 warning(
@@ -1320,13 +1507,38 @@ class ClaudeAccountSwitcher:
         whose mid-write failures this protects against).
         """
         staged: dict[str, Path] = {}
+        fd = -1
+
+        def abort() -> None:
+            # Remove only what THIS call created -- after closing a descriptor
+            # no file object took over: on Windows an open file cannot be
+            # unlinked, so the discard would otherwise fail exactly then.
+            nonlocal fd
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                fd = -1
+            self._discard_staging(staged)
+
         try:
             for num, (creds, config) in material.items():
                 for kind, content in (("creds", creds), ("config", config)):
                     if not content:
                         continue
                     path = self.credentials_dir / f".swap-staging-{kind}-{num}.json"
-                    if path.exists():
+                    # Claimed BEFORE the create: a signal delivered inside
+                    # os.open raises once the file already exists, so a record
+                    # made afterwards can miss a file that is there (#268).
+                    key = f"{kind}-{num}"
+                    staged[key] = path
+                    try:
+                        fd = os.open(
+                            path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600
+                        )
+                    except FileExistsError:
+                        del staged[key]  # not ours: never remove it
                         raise ConfigError(
                             f"Found leftover staging from an interrupted swap: "
                             f"{path}. It holds that slot's pre-swap credentials "
@@ -1334,19 +1546,25 @@ class ClaudeAccountSwitcher:
                             f"accounts still work (`ccswap list`), then delete "
                             f"the file and retry."
                         )
-                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        fd = -1  # the file object owns the descriptor now
                         fh.write(content)
-                    staged[f"{kind}-{num}"] = path
         except ConfigError:
-            # Leftover found: remove only what THIS call created.
-            self._discard_staging(staged)
+            # Leftover found.
+            abort()
             raise
         except OSError as e:
-            self._discard_staging(staged)
+            abort()
             raise ConfigError(
                 f"Could not stage swap material, nothing was changed: {e}"
             )
+        except BaseException:
+            # A Ctrl-C reaches neither handler above, and the caller never
+            # receives the dict to clean up: same policy. A leftover would
+            # hold plaintext credentials and wedge the next same-email swap
+            # behind the refusal above.
+            abort()
+            raise
         return staged
 
     def _swap_session_dirs(
@@ -1821,11 +2039,17 @@ class ClaudeAccountSwitcher:
         threshold: float,
         models: tuple[str, ...],
         account_windows: tuple[str, ...] = ("5h", "7d"),
+        gate_thresholds: dict[str, float] | None = None,
     ) -> None:
         """Pin the threshold/models/account_windows poll planning keys on (set
         by a hosted auto engine so cadence follows its effective, CLI-merged
-        settings instead of the settings file)."""
+        settings instead of the settings file).
+
+        ``gate_thresholds`` is the lowercased label → pct map of gates that
+        do not inherit ``threshold`` (empty/None = every gate shares it).
+        """
         self._poll_inputs_override = (threshold, models, account_windows)
+        self._poll_gate_overrides = dict(gate_thresholds or {})
 
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
@@ -1833,14 +2057,21 @@ class ClaudeAccountSwitcher:
         session threshold override would keep steering cadence after the
         engine it belonged to is gone."""
         self._poll_inputs_override = None
+        self._poll_gate_overrides = None
 
-    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
-        """Threshold + configured model names + account-window selection for
-        poll planning: the hosting engine's pinned values when present, else
-        the settings file (reloaded only when it changes — one stat per
-        pass)."""
+    def _load_poll_inputs(
+        self,
+    ) -> tuple[float, tuple[str, ...], tuple[str, ...], dict[str, float]]:
+        """Threshold, model names, account windows, and per-gate overrides.
+
+        The hosting engine's pin wins when present; otherwise the settings
+        file, reloaded only when it changes (one stat per pass). Model names
+        include ``autoswitch.modelThresholds`` so a Fable gate is visible to
+        cadence and to the 429-stale trust bound, not only to the engine.
+        """
         if self._poll_inputs_override is not None:
-            return self._poll_inputs_override
+            threshold, models, windows = self._poll_inputs_override
+            return threshold, models, windows, dict(self._poll_gate_overrides or {})
         path = settings_path(self.backup_dir)
         try:
             mtime: float | None = path.stat().st_mtime
@@ -1851,11 +2082,20 @@ class ClaudeAccountSwitcher:
         loaded = load_settings(self.backup_dir)
         inputs = (
             loaded.threshold,
-            parse_model_names(loaded.model),
+            effective_model_names(loaded),
             parse_window_selection(loaded.windows),
+            gate_thresholds(loaded).overrides,
         )
         self._poll_inputs_cache = (mtime, inputs)
         return inputs
+
+    def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...], tuple[str, ...]]:
+        """Threshold + configured model names + account-window selection for
+        poll planning: the hosting engine's pinned values when present, else
+        the settings file (reloaded only when it changes — one stat per
+        pass)."""
+        threshold, models, windows, _gates = self._load_poll_inputs()
+        return threshold, models, windows
 
     def switchable_account_numbers(self) -> list[str]:
         """Account numbers in rotation order eligible for automatic selection.
@@ -1973,7 +2213,7 @@ class ClaudeAccountSwitcher:
             return None
         data = self._get_sequence_data() or {}
         email, org_uuid = identity
-        return self._find_account_slot(data, email, org_uuid)
+        return self._find_live_account_slot(data, email, org_uuid)
 
     def has_live_login(self) -> bool:
         """Whether ``~/.claude.json`` carries any live account identity."""
@@ -2136,6 +2376,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
+            scan_live_sessions,
             session_dir_for,
             session_identity_drifted,
         )
@@ -2217,8 +2458,15 @@ class ClaudeAccountSwitcher:
                     .get("organizationUuid", "")
                     or ""
                 )
-                if not self._live_session_pids(account_num, email):
-                    sdir = session_dir_for(self.backup_dir, account_num, email)
+                sdir = session_dir_for(self.backup_dir, account_num, email)
+                sessions, unreadable = scan_live_sessions(sdir)
+                if unreadable:
+                    self._logger.info(
+                        "Account %s's session state could not be read; "
+                        "deferring the refresh. Restore access and retry.", account_num,
+                    )
+                    return oauth.RefreshOutcome(None, "session-unreadable")
+                if not sessions:
                     profile = read_session_credentials(sdir)
                     if (
                         profile
@@ -2696,9 +2944,11 @@ class ClaudeAccountSwitcher:
         return self._active_verdict().degraded
 
     def _read_account_credentials_ex(
-        self, account_num: str, email: str
+        self, account_num: str, email: str, *, cached: bool = False
     ) -> tuple[str, bool]:
-        return self._store._read_account_credentials_ex(account_num, email)
+        return self._store._read_account_credentials_ex(
+            account_num, email, cached=cached
+        )
 
     def list_unclaimed_credentials(self) -> dict[str, dict]:
         """Internal safety copies preserved at switch time (diagnostics only).
@@ -2770,22 +3020,22 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import scan_live_sessions
 
-        pids = self._live_session_pids(account_num, email)
+        session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = scan_live_sessions(session_dir)
+        pids = [s.pid for s in sessions]
         if pids:
             raise SessionError(
                 f"Account-{account_num} ({email}) has a live session-mode Claude "
                 f"instance (PID {', '.join(map(str, pids))}). "
                 f"Exit it first, then retry {action}."
             )
-        session_dir = self._session_dir(account_num, email)
-        _, unreadable = scan_live_sessions(session_dir)
         if unreadable:
             raise SessionError(
-                f"Account-{account_num} ({email}) has {unreadable} session "
-                f"record(s) that could not be read, so whether a Claude "
+                f"Account-{account_num} ({email}) has session state that could not be read "
+                f"({unreadable} unreadable record(s) or directory errors), so whether a Claude "
                 f"instance is live cannot be determined. Inspect "
-                f"{session_dir / 'sessions'} and remove or repair them, then "
-                f"retry {action}."
+                f"{session_dir / 'sessions'} and restore access or repair invalid records, "
+                f"then retry {action}. Do not remove records while Claude may still be running."
             )
 
     def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
@@ -2831,7 +3081,10 @@ class ClaudeAccountSwitcher:
         newer generation of this one); a profile flagged stale (the backup
         moved under it while it was live, and cswap has already decided it
         re-bootstraps); and anything unreadable, because a read error is not
-        evidence of drift.
+        evidence of drift. An unreadable identity file is the one exception:
+        like ``session_identity_drifted`` it reads as "not drift" here, so
+        the switch guard stays on its safe side; the adopting write, which
+        needs positive evidence, checks the identity itself.
         """
         from claude_swap.session import (
             is_session_stale,
@@ -2864,7 +3117,7 @@ class ClaudeAccountSwitcher:
 
     def _adopt_session_credential(
         self, account_num: str, email: str, org_uuid: str
-    ) -> bool:
+    ) -> bool | None:
         """Capture a quiescent session profile's credential into the slot backup.
 
         The complement of ``_post_backup_write``: that direction invalidates
@@ -2881,18 +3134,38 @@ class ClaudeAccountSwitcher:
         ``_bootstrap`` and the consume gate's persist move the same two
         copies. The store write is deliberately the pure one:
         ``_post_backup_write`` would invalidate the very profile just
-        captured, and the two now hold the same generation. Returns whether
-        the backup was advanced.
+        captured, and the two now hold the same generation.
+
+        Tri-state, because the usage fetch treats the two refusals
+        differently:
+
+        - True: the backup was advanced.
+        - False: the profile is not ahead of the backup (same generation,
+          behind a re-login, stale-marked, gone, or another account's), so
+          the backup is the slot's credential truth and safe to refresh.
+        - None: undecidable, and nothing was written. A claude is live
+          against the profile, a session record could not be read (that
+          family may still be rotating), or the profile's identity could
+          not be read. ``session_identity_drifted`` reads an unreadable
+          ``.claude.json`` as "not drift" -- the right degradation for a
+          read-only fetch and for the switch guard, where refusing is the
+          safe side -- but this is a WRITE: a profile that an in-session
+          /login re-pointed at another account, and whose identity file
+          then broke, would land a foreign credential in the slot's backup.
+          Checked after the generation test, so a profile provably on the
+          backup's generation still answers False with its identity gone.
         """
-        from claude_swap.session import profile_is_quiescent
+        from claude_swap.session import profile_is_quiescent, read_session_identity
 
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
             if not profile_is_quiescent(session_dir):
-                return False
+                return None
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
                 return False
+            if read_session_identity(session_dir) is None:
+                return None
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
             f"Adopted account {account_num}'s session profile credential "
@@ -3123,12 +3396,71 @@ class ClaudeAccountSwitcher:
                 return num
         return None
 
+    def _find_live_account_slot(
+        self, data: dict, email: str, organization_uuid: str, *, cached: bool = False
+    ) -> str | None:
+        """Slot of the LIVE login identity ``(email, organization_uuid)``.
+
+        Exact composite-key match first. Setup-token slots (``add-token``) are
+        stored personal (org "") because the token carries no org metadata and
+        cannot read the profile endpoint — but Claude Code later fills the
+        real organization into ``.claude.json`` from its own profile fetch.
+        Without a fallback the live login then matches no slot and reads as
+        unmanaged, so auto-switch stalls on ``unmanaged-active-account``.
+
+        So when the exact match fails, accept the one same-email setup-token
+        slot, but only if the live credential IS that slot's token. Setup-tokens
+        never rotate, so equality proves ownership; an unrelated login that
+        merely shares the email is never guessed into the slot (see
+        :meth:`current_account_number` on why a guess is dangerous).
+
+        Only for resolving the live login. Stored-identity lookups (mappings,
+        add/re-add, import) keep the exact :meth:`_find_account_slot`.
+        ``cached`` is for display callers polled by the TUI; anything that
+        decides a write reads the backup fresh.
+        """
+        num = self._find_account_slot(data, email, organization_uuid)
+        if num is not None or not organization_uuid:
+            return num
+        candidates = [
+            n for n, account in data.get("accounts", {}).items()
+            if account.get("email") == email
+            and not account.get("organizationUuid")
+            and not account.get("uuid")
+            and account.get("kind") != "api_key"
+        ]
+        if len(candidates) != 1:
+            return None
+        live = self._read_active_credentials().value
+        live_token = oauth.extract_access_token(live) if live else None
+        if not live_token:
+            return None
+        stored = self._read_account_credentials(candidates[0], email, cached=cached)
+        if stored and oauth.extract_access_token(stored) == live_token:
+            return candidates[0]
+        return None
+
     def _account_exists(self, email: str, organization_uuid: str) -> bool:
         """Check if account exists by (email, organizationUuid) composite key."""
         data = self._get_sequence_data()
         if not data:
             return False
         return self._find_account_slot(data, email, organization_uuid) is not None
+
+    def _slot_live_credential(self, account_num: str, live: str) -> str:
+        """The live credential as the active slot ``account_num`` owns it.
+
+        An API-key slot's login is the managed key, but the active read
+        returns Claude Code's OAuth item first, and that item can hold only
+        MCP login state (``{"mcpOAuth": …}``) while the key is active. Backing
+        that up or exporting it replaces the slot's key (#24), so an API-key
+        slot reads the managed key directly. ``""`` when no key is set.
+        """
+        if self._account_kind(account_num) == "api_key" and not looks_like_api_key(
+            live
+        ):
+            return self._store._read_managed_key()
+        return live
 
     def _account_kind(self, account_num: str | None) -> str:
         """Stored kind for a managed slot: ``"api_key"`` or ``"oauth"`` (default).
@@ -3333,14 +3665,14 @@ class ClaudeAccountSwitcher:
 
         ``add_account`` snapshots the *live* active credential under an
         ``oauthAccount`` identity. Now that ``_read_credentials`` can return a raw
-        ``sk-ant-api…`` key, a live ``/login`` key could be backed up as a kindless
+        ``sk-ant-…`` key, a live ``/login`` key could be backed up as a kindless
         account, corrupting the session-guard / export / collision logic that keys
         off ``kind``. Reject with guidance toward the supported path instead.
         """
         if looks_like_api_key(creds):
             raise ValidationError(
                 "Active login is an API-key account. Add it with "
-                "'ccswap --add-token sk-ant-api...' instead of --add-account."
+                "'ccswap add-token sk-ant-...' instead of 'ccswap add'."
             )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
@@ -3779,12 +4111,14 @@ class ClaudeAccountSwitcher:
 
         Useful for headless servers or when the token is received from another
         machine, without needing a prior Claude Code login on this machine. The
-        token type is auto-detected: an ``sk-ant-api…`` value is a managed API key
-        (stored raw, activated on Claude Code's API-key auth axis), anything else is
-        treated as an OAuth setup-token. No Anthropic API calls are made.
+        token type is auto-detected: a bare ``sk-ant-…`` value of any Console key
+        family (``sk-ant-api03-…``, ``sk-ant-usr-…``, …) is a managed API key
+        (stored raw, activated on Claude Code's API-key auth axis); an OAuth-prefixed
+        ``sk-ant-oat…`` token — or anything else — is treated as an OAuth
+        setup-token. No Anthropic API calls are made.
 
         Args:
-            token: Raw OAuth setup-token or ``sk-ant-api…`` key, or ``"-"`` to read
+            token: Raw OAuth setup-token or ``sk-ant-…`` API key, or ``"-"`` to read
                    one line from stdin, or ``""`` to prompt securely via getpass.
             email: Email address to associate with the account. When omitted,
                    defaults to ``setup-token-{slot}@token.local`` (or
@@ -4079,7 +4413,9 @@ class ClaudeAccountSwitcher:
         active_num = None
         if current_identity is not None:
             current_email, current_org_uuid = current_identity
-            active_num = self._find_account_slot(data, current_email, current_org_uuid)
+            active_num = self._find_live_account_slot(
+                data, current_email, current_org_uuid, cached=True
+            )
 
         accounts_info: list[tuple[int, str, str, str, bool, str, str]] = []
         # Reset each build; set below only when the active slot's OAuth Keychain
@@ -4099,7 +4435,12 @@ class ClaudeAccountSwitcher:
                 creds = active.value or ""
                 self._record_active_verdict(active)
             else:
-                creds = self._read_account_credentials(str(num), email)
+                # Display read cache: this value feeds sentinels, token-status
+                # lines and the usage GET. Nothing writes or POSTs it — the
+                # consume gate re-reads under its lock and adopts a moved
+                # generation instead of consuming a stale snapshot, and
+                # strike binding re-reads before any heal (_entry_token_dead).
+                creds = self._read_account_credentials(str(num), email, cached=True)
 
             accounts_info.append((num, email, org_name, org_uuid, is_active, creds, alias))
         return accounts_info
@@ -4614,8 +4955,16 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
+                        # A successor built from the backup (or the
+                        # collector's read) carries that snapshot's shared
+                        # fields (mcpOAuth, ...); the live store's are current.
+                        live_write = working
+                        if refresh_input != live:
+                            live_write = self._prepare_credentials_for_activation(
+                                working, live
+                            )
                         with claude_config_lock():
-                            self._write_credentials(working)  # active store — CC reads this
+                            self._write_credentials(live_write)  # active store — CC reads this
                     except Exception:
                         live_ok = False
                         self._logger.warning(
@@ -4818,8 +5167,11 @@ class ClaudeAccountSwitcher:
                 self._active_keychain_unavailable or self._active_read_unreadable
             ):
                 return USAGE_KEYCHAIN_UNAVAILABLE
+            # Display read cache (a verdict, never bytes): a hit is the read
+            # `_build_accounts_info` just made; after a failure the cooldown
+            # makes this re-read free of spawns.
             if not is_active and self._read_account_credentials_ex(
-                str(num), email
+                str(num), email, cached=True
             )[1]:
                 # THIS slot's own read, not the process flag — which one
                 # slot's clean read erased for every other slot. Measured with
@@ -4893,15 +5245,33 @@ class ClaudeAccountSwitcher:
             # refresh included, on that credential. A profile already on the
             # backup's generation, or behind a fresh re-login in the backup,
             # needs no adoption and takes the same path on the backup. An
-            # adoption refused for any other reason (lock contention, a
-            # session record that could not be read) leaves both copies as
-            # they were.
+            # adoption that could not be decided -- a session record that
+            # could not be read, lock contention, an unreadable profile
+            # identity, a failed write -- leaves both copies as they were
+            # AND keeps the profile's credential for the read-only fetch
+            # below, as before adoption existed: the backup path would POST
+            # a grant the profile may already have consumed (invalid_grant,
+            # and a healthy slot struck), or rotate a family that a claude
+            # behind the unreadable record still owns.
             try:
-                if self._adopt_session_credential(str(num), email, org_uuid):
-                    creds = session_creds
+                adopted = self._adopt_session_credential(str(num), email, org_uuid)
             except LockError:
-                pass
-            session_creds = None
+                adopted = None
+            except Exception as e:
+                # Never raises: this runs one worker per slot under
+                # ``_run_usage_fetches``'s executor.map, where a raise
+                # discards every slot's result for the pass (and the auto
+                # engine's whole tick). The store write re-raises a failed
+                # file write, and the lock file's own open can fail likewise.
+                self._logger.warning(
+                    f"Could not adopt account {num}'s session profile "
+                    f"credential into its backup: {e}"
+                )
+                adopted = None
+            if adopted:
+                creds = session_creds
+            if adopted is not None:
+                session_creds = None
         if session_creds:
             session_oauth = oauth.extract_oauth_data(session_creds)
             if session_oauth and session_oauth.get("accessToken"):
@@ -5033,6 +5403,10 @@ class ClaudeAccountSwitcher:
                 continue
             entry = entries[num]
             _i = info_by_num[num]
+            if _i[4]:
+                self._heal_active_quarantine_from_live(
+                    entry, num, _i[1], _i[3], _i[5]
+                )
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
                 sentinels[num] = USAGE_RELOGIN_REQUIRED
             elif entry.auth_dead_strikes and entry.token_dead():
@@ -5075,11 +5449,19 @@ class ClaudeAccountSwitcher:
         # state so the auto engine idle-holds instead of counting the gap
         # toward a spurious failover (Finding 2). When the gate lifts, the
         # fetch path refreshes the token and the sentinel clears itself.
+        now = store.clock()
         for num, info in info_by_num.items():
             if num in sentinels or not info[4]:  # info[4] = is_active
                 continue
             if num in claims:
                 continue  # the fetch path will handle (or sentinel) it now
+            if entries[num].held(now):
+                # Held for another machine's reading (``cswap import-usage``):
+                # that reading, not this token's refresh, is what the row is
+                # waiting on, and it stays decision-trusted, so there is no
+                # gap to idle-hold over. The fetch path refreshes the token
+                # once the hold lapses.
+                continue
             active_oauth = oauth.extract_oauth_data(info[5])
             if active_oauth and oauth.is_oauth_token_expired(
                 active_oauth.get("expiresAt")
@@ -5115,6 +5497,61 @@ class ClaudeAccountSwitcher:
             num: with_sentinel(entries[num], sentinels.get(num))
             for num in info_by_num
         }
+
+    def _heal_active_quarantine_from_live(
+        self,
+        entry: UsageEntry,
+        num: str,
+        email: str,
+        org_uuid: str,
+        live: str,
+    ) -> None:
+        """Let a quarantined ACTIVE slot resync its stale backup from live.
+
+        ``_entry_token_dead`` holds an active slot's strike while ANY stored
+        source still carries the struck generation. When Claude Code rotated
+        the live credential, the backup is left on the struck (consumed)
+        generation, and the only thing that resyncs it —
+        ``_resync_rotated_backup`` on the fetch fast path — never runs for a
+        quarantined slot (its sentinel keeps it out of ``requested``). Left
+        alone that is a deadlock: a healthy, working account reads "re-login
+        needed" forever. Attempting the resync here breaks it; the caller
+        then re-evaluates the verdict, and a backup that no longer matches
+        the struck fingerprint lets its existing branch clear the strike row.
+
+        Only attempted when the live credential is demonstrably a NEWER
+        lineage than the struck one and ``_resync_rotated_backup`` can
+        actually use it, so a pass that cannot succeed costs no network:
+
+        - the strike is at threshold and bound to a fingerprint (a legacy
+          unbound row cannot say which generation was condemned);
+        - live is not the condemned generation itself;
+        - live carries a full token pair and an unexpired access token — the
+          ownership probe authenticates with it;
+        - the active read is neither degraded (its bytes may be the consumed
+          predecessor, so writing them could clobber a fresher backup — the
+          same rule as the fast path) nor unreadable.
+
+        Ownership attribution, locking, verdict memoization and the
+        never-raises contract all stay in ``_resync_rotated_backup``; the
+        probe runs before any lock, and this scan holds none.
+        """
+        struck = entry.struck_fingerprint
+        if struck is None or not entry.token_dead():
+            return
+        if oauth.credential_fingerprint(live) in (None, struck):
+            return
+        live_oauth = oauth.extract_oauth_data(live)
+        if not (
+            live_oauth
+            and live_oauth.get("accessToken")
+            and live_oauth.get("refreshToken")
+            and not oauth.is_oauth_token_expired(live_oauth.get("expiresAt"))
+        ):
+            return
+        if self._active_read_degraded or self._active_read_unreadable:
+            return
+        self._resync_rotated_backup(num, email, org_uuid, live)
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         """Is this slot quarantined as refresh-token-dead, right now?
@@ -5191,31 +5628,37 @@ class ClaudeAccountSwitcher:
         every pass whenever the two lineages differ — the strike/heal/re-POST
         loop that keeps a dead backup out of quarantine forever. The strike
         holds while ANY stored source still matches the struck generation.
+
+        Holding needs no read beyond the caller's ``stored``; HEALING always
+        re-reads the backup fresh, for idle slots too. ``stored`` may be a
+        display-cached backup (``_build_accounts_info`` reads with
+        ``cached=True``) and the caller spends a "healed" answer on
+        ``clear_dead_token`` — a persisted write that also lifts the backoff.
+        With the cache holding generation A while another process rotated
+        the slot to B and B was struck, a cached fingerprint "heals" B's
+        strike on every pass and each pass POSTs B's dead grant again. A
+        stale fingerprint may only ever over-hold; it must never heal. With
+        no strike at threshold there is nothing to bind, so nothing is read
+        at all (the active slot's backup used to be read on every pass for
+        this). ``is_active`` no longer changes the procedure; it stays for
+        the callers.
         """
+        if not entry.token_dead():
+            return False
         if entry.token_dead(stored_fp=oauth.credential_fingerprint(stored)):
             return True
-        if not is_active:
-            return False
         backup, unreadable = self._read_account_credentials_ex(num, email)
         if unreadable:
-            # The second source cannot be seen, so "no stored source matches
-            # the struck generation" is unproven — and the caller's `elif`
-            # spends that answer on `clear_dead_token`, which zeroes
-            # authDeadStrikes AND struckFingerprint in the PERSISTED store.
-            # One momentary lock would un-quarantine a genuinely dead account
-            # permanently and resume POSTing its dead grant. Holding the
-            # strike costs one pass of "re-login needed" on a row that
+            # The source that could still carry the struck generation cannot
+            # be seen, so "no stored source matches" is unproven — and the
+            # caller's `elif` spends that answer on `clear_dead_token`, which
+            # zeroes authDeadStrikes AND struckFingerprint in the PERSISTED
+            # store. One momentary lock would un-quarantine a genuinely dead
+            # account permanently and resume POSTing its dead grant. Holding
+            # the strike costs one pass of "re-login needed" on a row that
             # already took AUTH_DEAD_STRIKES invalid_grants; erasing it costs
             # the quarantine itself.
-            #
-            # Gated on an actual strike existing (``entry.token_dead()``, no
-            # ``stored_fp`` — we can't verify which generation, so this only
-            # asks whether the count itself has reached threshold): the
-            # first check above already proved the LIVE credential doesn't
-            # carry the struck generation, so a row with zero strikes has
-            # nothing to hold — an unreadable backup on an otherwise-healthy
-            # account must not manufacture "re-login needed" out of nothing.
-            return entry.token_dead()
+            return True
         return bool(backup) and entry.token_dead(
             stored_fp=oauth.credential_fingerprint(backup)
         )
@@ -5236,7 +5679,7 @@ class ClaudeAccountSwitcher:
         # of autoswitch.windows: excluding a window here would make polling
         # itself blind to it, not just the switch decision, and users can
         # still see the ignored window's usage in `ccswap list`.
-        threshold, models, _account_windows = self._poll_policy_inputs()
+        threshold, models, _account_windows, gate_overrides = self._load_poll_inputs()
         plans: dict[str, tuple[float | None, float | None]] = {}
         for num, rec in records.items():
             if rec.sentinel is not None or rec.error is not None:
@@ -5252,6 +5695,7 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
+                gate_thresholds=gate_overrides or None,
             )
         return plans
 
@@ -5395,6 +5839,61 @@ class ClaudeAccountSwitcher:
         if current_headroom <= 0:
             return None, "exhausted"
         return None, "stay"
+
+    def _select_consume_first_switchable(
+        self,
+        current_num: str | None,
+        models: tuple[str, ...] = (),
+        usage: dict | None = None,
+    ) -> tuple[str | None, str]:
+        """Decide the ``consume-first`` strategy target.
+
+        Picks the account whose weekly (7d) window resets soonest among those
+        with headroom left, current included, even when it has less headroom
+        than a peer: quota left at a reset is lost, so the most perishable
+        quota goes first. Same ranking as ``ccswap auto``'s consume-first.
+        A past ``resets_at`` counts as unknown (a stale snapshot would
+        otherwise rank the account that just rolled over as soonest).
+
+        When no account with headroom has a known weekly reset there is
+        nothing to rank by, so this falls back to
+        :meth:`_select_best_switchable` and returns its ``(target, note)``.
+        Otherwise returns ``(num, "")`` to switch or ``(None, "soonest-reset")``
+        when the current account already resets soonest. Ties go to the current
+        account, then to the earliest slot.
+        """
+        data = self._get_sequence_data() or {}
+        others = [
+            str(n) for n in data.get("sequence", [])
+            if str(n) != str(current_num)
+            and self._account_is_switchable(str(n))
+            and not self._disabled_from_data(data, str(n))
+        ]
+        if not others:
+            return None, "none"
+
+        if usage is None:
+            usage = self._usage_by_account()
+        now = time.time()
+        ranked = []
+        for num in [str(current_num), *others]:
+            u = usage.get(num)
+            headroom = oauth.account_headroom(u, models)
+            window = u.get("seven_day") if isinstance(u, dict) else None
+            reset = (
+                poll_policy.parse_reset_ts(window.get("resets_at"))
+                if isinstance(window, dict) else None
+            )
+            if headroom is not None and headroom > 0 and reset is not None and reset > now:
+                ranked.append((reset, num))
+        if not ranked:
+            return self._select_best_switchable(current_num, models, usage)
+
+        # min() keeps the first minimal element: current, then rotation order.
+        _reset, target = min(ranked, key=lambda t: t[0])
+        if target == str(current_num):
+            return None, "soonest-reset"
+        return target, ""
 
     def _duplicate_account_warnings(
         self, accounts_info: list[tuple[int, str, str, str, bool, str, str]]
@@ -5686,7 +6185,9 @@ class ClaudeAccountSwitcher:
                 "active": {"email": current_email, "managed": False},
             }
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_live_account_slot(
+            data, current_email, current_org_uuid, cached=True
+        )
         if not account_num:
             return {
                 "schemaVersion": SCHEMA_VERSION,
@@ -5737,6 +6238,8 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_status_payload()
 
+        self._warn_residual_keychain_items()
+
         identity = self._get_current_account()
         if identity is None:
             print(f"{bolded('Status:')} {dimmed('No active Claude account')}")
@@ -5748,7 +6251,9 @@ class ClaudeAccountSwitcher:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
             return None
 
-        account_num = self._find_account_slot(data, current_email, current_org_uuid)
+        account_num = self._find_live_account_slot(
+            data, current_email, current_org_uuid, cached=True
+        )
         org_name = ""
         if account_num is not None:
             org_name = data["accounts"][account_num].get("organizationName", "") or ""
@@ -5861,7 +6366,10 @@ class ClaudeAccountSwitcher:
             strategy: Usage-aware target selection. ``"best"`` jumps to the
                   switchable account with the most remaining 5h/7d quota instead
                   of advancing the rotation; ``"next-available"`` rotates to the
-                  next account, skipping any currently at its 5h/7d limit. ``None``
+                  next account, skipping any currently at its 5h/7d limit;
+                  ``"consume-first"`` jumps to the account with headroom whose
+                  weekly window resets soonest (see
+                  ``_select_consume_first_switchable``). ``None``
                   (the default) performs a plain rotation.
             models: Per-model weekly windows folded into every usage
                   comparison of the usage-aware strategies (parsed display
@@ -5879,7 +6387,10 @@ class ClaudeAccountSwitcher:
         normal path (a live Claude login present); the fresh-machine path (no
         live login, e.g. right after --import) ignores them.
         """
-        strategy_label = strategy if strategy in ("best", "next-available") else "rotation"
+        strategy_label = (
+            strategy if strategy in ("best", "next-available", "consume-first")
+            else "rotation"
+        )
         warnings: list[str] = []
         if strategy_label == "rotation":
             models = ()  # model limits only steer the usage-aware strategies
@@ -5955,8 +6466,14 @@ class ClaudeAccountSwitcher:
 
         current_email, current_org_uuid = identity
 
-        # Check if current account is managed
-        if not self._account_exists(current_email, current_org_uuid):
+        # Check if current account is managed. Resolve the LIVE slot (not the
+        # exact composite key): a setup-token login whose org Claude Code has
+        # since filled in is still managed, and treating it as unmanaged would
+        # auto-add it below as a duplicate slot.
+        live_num = self._find_live_account_slot(
+            self._get_sequence_data() or {}, current_email, current_org_uuid
+        )
+        if live_num is None:
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
@@ -5981,23 +6498,20 @@ class ClaudeAccountSwitcher:
 
         if len(sequence) < 2:
             if json_output:
-                num = self._find_account_slot(data, current_email, current_org_uuid)
                 return self._switch_noop(
                     strategy=strategy_label,
                     reason="only-one-account",
-                    to_ref=account_ref(int(num), current_email) if num else None,
+                    to_ref=account_ref(int(live_num), current_email),
                     message="Only one account is managed. Add more accounts to switch between.",
                 )
             print(dimmed("Only one account is managed. Add more accounts to switch between."))
             return None
 
         active_account = data.get("activeAccountNumber")
-        # Where the user actually is right now (live identity), falling back to
-        # the recorded active slot. Used so usage-aware switching never moves
-        # them onto an account worse than their current one.
-        current_num = self._find_account_slot(data, current_email, current_org_uuid)
-        if current_num is None:
-            current_num = str(active_account) if active_account is not None else None
+        # Where the user actually is right now (live identity). Used so
+        # usage-aware switching never moves them onto an account worse than
+        # their current one.
+        current_num = live_num
 
         current_ref = (
             account_ref(int(current_num), current_email) if current_num else None
@@ -6006,12 +6520,16 @@ class ClaudeAccountSwitcher:
         # Usage-aware "jump to most headroom". Only switches when another
         # account is provably better; otherwise stays put (never moves onto a
         # worse or unverifiable account). Bare `cswap --switch` rotates anyway.
-        if strategy == "best":
+        # "consume-first" shares this path: it ranks by soonest weekly reset
+        # instead, and adds the "soonest-reset" stay below.
+        if strategy in ("best", "consume-first"):
             best_usage = self._usage_by_account()
             self._warn_inert_models(best_usage, models, json_output, warnings)
-            target, note = self._select_best_switchable(
-                current_num, models, best_usage
+            select = (
+                self._select_consume_first_switchable if strategy == "consume-first"
+                else self._select_best_switchable
             )
+            target, note = select(current_num, models, best_usage)
             if target is not None:
                 op = self._perform_switch(target, emit_output=not json_output)
                 return (
@@ -6075,6 +6593,21 @@ class ClaudeAccountSwitcher:
                     )
                 print(
                     f"{accent('Already on the account with the most remaining quota')} "
+                    f"(Account-{current_num})."
+                )
+                return None
+            if note == "soonest-reset":
+                msg = (
+                    f"Already on the account whose weekly limit resets soonest "
+                    f"(Account-{current_num})."
+                )
+                if json_output:
+                    return self._switch_noop(
+                        strategy=strategy_label, reason="already-best",
+                        to_ref=current_ref, warnings=warnings, message=msg,
+                    )
+                print(
+                    f"{accent('Already on the account whose weekly limit resets soonest')} "
                     f"(Account-{current_num})."
                 )
                 return None
@@ -6312,7 +6845,7 @@ class ClaudeAccountSwitcher:
         if not force and data:
             identity = self._get_current_account()
             if identity is not None:
-                cur_slot = self._find_account_slot(data, identity[0], identity[1])
+                cur_slot = self._find_live_account_slot(data, identity[0], identity[1])
                 if cur_slot == target_account:
                     action, provenance = self._self_switch_action(
                         target_account, identity[0]
@@ -6444,7 +6977,7 @@ class ClaudeAccountSwitcher:
         if identity is None:
             return result
         data = self._get_sequence_data() or {}
-        slot = self._find_account_slot(data, identity[0], identity[1])
+        slot = self._find_live_account_slot(data, identity[0], identity[1])
         if slot is None:
             return result
         backup = self._read_account_credentials(slot, identity[0])
@@ -6752,6 +7285,7 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import scan_live_sessions
 
         self._refuse_session_shell()
+        self._require_file_backup(target_account)
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
         # also has a live session profile puts the same refresh token in two
@@ -6760,7 +7294,9 @@ class ClaudeAccountSwitcher:
         # backup, the backup is a consumed generation and activating it is
         # certain to fail: refuse. With nothing running against the profile
         # the fix is simpler still — adopt its credential into the backup
-        # first, and the switch activates the live generation.
+        # first, and the switch activates the live generation. An adoption
+        # that cannot be decided while the profile is ahead refuses likewise:
+        # the backup is a consumed generation either way.
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
@@ -6802,7 +7338,30 @@ class ClaudeAccountSwitcher:
                     else:
                         warnings_out.append(msg)
             else:
-                self._adopt_session_credential(target_account, pre_email, pre_org)
+                adopted = self._adopt_session_credential(
+                    target_account, pre_email, pre_org
+                )
+                if adopted is None and self._session_profile_ahead(
+                    target_account, pre_email, pre_org
+                ):
+                    # Undecidable with the profile provably ahead: the
+                    # identity check inside the adoption refused the write
+                    # (or a claude started against the profile since the
+                    # scan above). Either way the backup is a consumed
+                    # generation, and proceeding would activate it silently
+                    # -- the very landmine adoption exists to defuse.
+                    raise SwitchError(
+                        f"Account-{target_account} ({pre_email}) has a session "
+                        "profile whose credential has rotated past the stored "
+                        "backup, and it could not be adopted into the backup: "
+                        "the profile's identity file (.claude.json) could not "
+                        "be read, or a Claude instance started against it just "
+                        "now. The backup is a consumed generation, and "
+                        "activating it would fail with invalid_grant on its "
+                        "first refresh. Re-login inside the profile "
+                        f"('ccswap run {target_account}', then /login) so its "
+                        "identity is rewritten, or switch to another account."
+                    )
 
         # Pre-lock identity resolution (may hit the network — must happen
         # before the locks). Callers that already resolved (self-switch
@@ -6832,7 +7391,7 @@ class ClaudeAccountSwitcher:
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
-                current_account = self._find_account_slot(
+                current_account = self._find_live_account_slot(
                     data, current_email, current_org_uuid
                 )
 
@@ -6992,11 +7551,10 @@ class ClaudeAccountSwitcher:
                 except Exception:
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
-                            )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                            # By rename, never in place: a running Claude Code
+                            # watches ~/.claude.json, and a truncate-then-write
+                            # shows it an empty file (#419).
+                            atomic_write_text(config_path, rollback_config_text)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"
@@ -7051,6 +7609,17 @@ class ClaudeAccountSwitcher:
                         "Current account credential is empty (Keychain unreadable?); "
                         "refusing to overwrite its backup"
                     )
+                # What the outgoing slot backs up. original_creds stays the
+                # raw live read: activation takes its shared MCP fields and
+                # rollback restores it.
+                outgoing_creds = self._slot_live_credential(
+                    current_account, original_creds
+                )
+                if not outgoing_creds:
+                    raise CredentialReadError(
+                        f"Account-{current_account}'s API key is not set in "
+                        "Claude Code; refusing to overwrite its backup"
+                    )
                 original_config = config_path.read_text(encoding="utf-8")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
@@ -7074,7 +7643,7 @@ class ClaudeAccountSwitcher:
                 # back to the exact pre-fix backup, so endpoint state never
                 # decides whether a switch completes.
                 kind, foreign_slot = self._classify_outgoing_credential(
-                    current_account, current_email, original_creds,
+                    current_account, current_email, outgoing_creds,
                     provenance, data,
                 )
                 if kind in ("foreign", "alien", "known-foreign"):
@@ -7083,7 +7652,7 @@ class ClaudeAccountSwitcher:
                     # on failure, aborting before the live store is
                     # overwritten) is the license to proceed.
                     self._stash_live_credential(
-                        original_creds, kind, current_account,
+                        outgoing_creds, kind, current_account,
                         provenance.get("resolved"),
                     )
                     if kind == "foreign":
@@ -7162,7 +7731,7 @@ class ClaudeAccountSwitcher:
                     # indistinguishable from a legitimate rotation, so a
                     # warning would cry wolf.
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email, outgoing_creds
                     )
                     self._write_account_config(
                         current_account, current_email, original_config
@@ -7187,7 +7756,7 @@ class ClaudeAccountSwitcher:
                     )
                 else:  # own-family / own-rotated
                     self._write_account_credentials(
-                        current_account, current_email, original_creds
+                        current_account, current_email, outgoing_creds
                     )
                     self._write_account_config(
                         current_account, current_email, original_config
@@ -7321,6 +7890,47 @@ class ClaudeAccountSwitcher:
             ))
         else:
             print(dimmed("New account is active on your next message — no restart needed."))
+        self._warn_residual_keychain_items()
+
+    def _residual_keychain_items(self) -> list[str]:
+        """Active Claude Code Keychain services that can shadow file mode.
+
+        Attribute-only ``item_exists`` checks never decrypt secrets or feed the
+        credential store's Keychain capability state.
+        """
+        if self.platform != Platform.MACOS or self.credential_backend != "file":
+            return []
+        # The OAuth item's name depends on the profile (CLAUDE_CONFIG_DIR hashes
+        # it), so resolve it the way the credential store does.
+        from claude_swap.credentials import _active_oauth_keychain_services
+
+        account = macos_keychain.keychain_account_name()
+        return [
+            service
+            for service in (
+                *_active_oauth_keychain_services(),
+                CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
+            )
+            if macos_keychain.item_exists(service, account)
+        ]
+
+    def _warn_residual_keychain_items(self) -> None:
+        """Warn when unlocked-Keychain credentials would override file mode."""
+        services = self._residual_keychain_items()
+        if not services:
+            return
+        names = ", ".join(f'"{service}"' for service in services)
+        commands = ", ".join(
+            f'`security delete-generic-password -s "{service}"`'
+            for service in services
+        )
+        warning(
+            f"Residual Keychain item(s) {names} exist. Claude Code reads the "
+            "Keychain before the credential file, so an unlocked-Keychain "
+            "environment (such as a GUI session) will override the file written "
+            f"by ccswap. From a GUI terminal, run {commands}, or use Claude Code "
+            "only over SSH."
+        )
 
     def purge(self) -> None:
         """Remove all traces of claude-swap from the system.
@@ -7341,11 +7951,32 @@ class ClaudeAccountSwitcher:
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
         sessions_root = self.backup_dir / "sessions"
-        session_dirs = (
-            [d for d in sessions_root.iterdir() if d.is_dir()]
-            if sessions_root.is_dir()
-            else []
-        )
+        try:
+            root_is_dir = S_ISDIR(sessions_root.stat().st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            root_is_dir = False
+        except OSError as exc:
+            raise SessionError(
+                f"Session root {sessions_root} could not be read. "
+                "Restore access, then retry --purge."
+            ) from exc
+        session_dirs = []
+        if root_is_dir:
+            try:
+                # Inspect every child explicitly: is_dir can suppress stat errors.
+                for d in sessions_root.iterdir():
+                    try:
+                        mode = d.stat().st_mode
+                    except FileNotFoundError:
+                        # It disappeared, or is a symlink whose target is gone.
+                        continue
+                    if S_ISDIR(mode):
+                        session_dirs.append(d)
+            except OSError as exc:
+                raise SessionError(
+                    f"Session profiles under {sessions_root} could not be read. "
+                    "Restore access, then retry --purge."
+                ) from exc
         from claude_swap.session import scan_live_sessions
 
         live = {}
@@ -7372,8 +8003,9 @@ class ClaudeAccountSwitcher:
             raise SessionError(
                 f"Session records that could not be read: {details}. Whether a "
                 "Claude instance is live cannot be determined, and purging "
-                "would pull a live profile out from under it. Repair or remove "
-                "them, then retry --purge."
+                "would pull a live profile out from under it. Restore access or "
+                "repair invalid records, then retry --purge. Do not remove "
+                "records while Claude may still be running."
             )
 
         warning("This will remove ALL claude-swap data from your system:")

@@ -28,6 +28,13 @@ from claude_swap.tui import data as tui_data
 from claude_swap.usage_store import UsageEntry
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_plugin_list():
+    # The Settings menu reads the mod's state through the real `claude` CLI.
+    with patch("claude_swap.claude_integration.mod_installed", return_value=False):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Builders
 # ---------------------------------------------------------------------------
@@ -195,8 +202,10 @@ class FakeSwitcher:
         threshold: float,
         models: tuple[str, ...],
         account_windows: tuple[str, ...] = ("5h", "7d"),
+        gate_thresholds: dict | None = None,
     ) -> None:
         self._poll_inputs_override = (threshold, models, account_windows)
+        self._poll_gate_overrides = gate_thresholds
 
     def clear_poll_policy_inputs(self) -> None:
         self._poll_inputs_override = None
@@ -317,6 +326,22 @@ async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
 
+def footer_labels(screen) -> list[str]:
+    from textual.widgets._footer import FooterKey
+
+    return [key.description for key in screen.query(FooterKey)]
+
+
+async def footer_after(pilot) -> list[str]:
+    """Footer labels once the footer has recomposed (slow on Windows CI)."""
+    for _ in range(50):
+        await pilot.pause()
+        labels = footer_labels(pilot.app.screen)
+        if labels:
+            return labels
+    return []
+
+
 async def menu_select(pilot, action_id: str) -> None:
     """Drive the dashboard menu: highlight the entry by id, press Enter."""
     from textual.widgets import ListView
@@ -406,6 +431,47 @@ class TestFormatting:
         text = account_card_text(acc, 100, palette=Palette.from_theme(CSWAP_LIGHT))
         styles = {str(span.style) for span in text.spans}
         assert any(ACCENT_LIGHT in s for s in styles)  # active marker uses light accent
+
+    def test_mask_email_keeps_accounts_distinguishable(self):
+        assert tui_data.mask_email("alice@acme.com") == "a•••e@a•••.com"
+        assert tui_data.mask_email("user1@example.com") == "u•••1@e•••.com"
+        assert tui_data.mask_email("user2@example.com") == "u•••2@e•••.com"
+        assert tui_data.mask_email("ab@x.com") == "a•@•.com"
+        assert tui_data.mask_email("a@x.io") == "•@•.io"
+        assert tui_data.mask_email("bob@acme.co.uk") == "b•b@a•••.co.uk"
+        assert "secret" not in tui_data.mask_emails_in_text(
+            "Account-2 (secret@example.com) quarantined"
+        )
+
+    def test_present_tag_leaves_generic_labels(self):
+        assert tui_data.present_tag("personal", mask=True) == "personal"
+        assert tui_data.present_tag("Codex Team", mask=True) == "Codex Team"
+        assert tui_data.present_tag("Acme Corp", mask=True) == "A••• C•••"
+        assert tui_data.present_alias("dev", mask=True) == "dev"
+        assert tui_data.present_alias("me@work.com", mask=True) == "m•@w•••.com"
+
+    def test_account_card_masks_email_and_org_but_keeps_alias(self):
+        from claude_swap.tui.widgets import account_card_text, mini_account_text
+
+        acc = dataclasses.replace(
+            make_account(1, active=True, alias="dev", email="alice@acme.com"),
+            org_name="Acme Corp",
+        )
+        plain = account_card_text(acc, 100, mask=True).plain
+        assert "alice@acme.com" not in plain
+        assert "Acme Corp" not in plain
+        assert "dev (a•••e@a•••.com)" in plain
+        assert "[A••• C•••]" in plain
+        mini = mini_account_text(acc, time.time(), mask=True).plain
+        assert "alice@acme.com" not in mini
+        assert "dev (a•••e@a•••.com)" in mini
+
+        plan = dataclasses.replace(
+            make_account(2, email="a@b.co"), org_name="Codex Team"
+        )
+        plan_plain = account_card_text(plan, 80, mask=True).plain
+        assert "[Codex Team]" in plan_plain
+        assert "a@b.co" not in plan_plain
 
     def test_window_helpers(self):
         entry = make_entry(pct5=47.0)
@@ -608,9 +674,7 @@ class TestUsageRows:
             usage_rows,
         )
 
-        # Keep the boundary exact across platforms: round-tripping an arbitrary
-        # time.time() value through ISO microseconds can land just below 48h,
-        # which the countdown correctly floors to "1d 23h".
+        # Fixed time keeps the countdown and local date deterministic.
         now = 1_700_000_000.0
         usage = {
             "weekly": {"pct": 42.0},
@@ -632,7 +696,7 @@ class TestUsageRows:
 
         assert [row[0] for row in usage_rows(usage, now)] == ["Weekly"]
         assert reset_credits_text(usage, now) == (
-            "3 banked · earliest expires 2d"
+            f"3 banked · earliest expires in 2d 0h ({datetime.fromtimestamp(now + 2 * 86400).astimezone().strftime('%Y-%m-%d %H:%M %Z (%z)')})"
         )
         assert credits_text(usage, now) == "2,500.00 available"
         assert credit_allowance_text(usage, now) == (
@@ -981,7 +1045,7 @@ class TestDashboard:
             await pilot.press("down", "down", "down", "down", "down", "down", "enter")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
-            assert ids == ["add-login:claude", "add-token", "add-login:codex", "back"]
+            assert ids == ["add-login:claude", "add-token", "add-login:codex", "add-login:agy", "back"]
             await pilot.press("escape")
             await pilot.pause()
             ids = [item.action_id for item in menu.query(MenuItem)]
@@ -2065,6 +2129,9 @@ class _FakeEngine:
         self.settings = dataclasses.replace(self.settings, threshold=threshold)
         self.applied_thresholds.append(threshold)
 
+    def apply_gates(self, settings) -> None:
+        self.settings = settings
+
     def wake(self) -> None:
         self.wakes += 1
 
@@ -2121,7 +2188,7 @@ class TestAutoScreen:
             codex.fetch_sets.clear()
             await pilot.press("g")  # hidden binding uses remembered Claude default
             await settle(pilot)
-            assert app._store_only == {"claude": True, "codex": False}
+            assert app._store_only == {"claude": True, "codex": False, "agy": False}
             assert claude.fetch_sets and claude.fetch_sets[-1] == set()
             assert codex.fetch_sets and codex.fetch_sets[-1] is None
 
@@ -2267,6 +2334,60 @@ class TestAutoScreen:
             await pilot.pause()
             assert screen._settings.threshold == 50.0  # spec's lower bound
 
+    async def test_adjust_popup_steps_each_gate(self, tmp_path, fake_engine):
+        import json as _json
+
+        (tmp_path / "settings.json").write_text(_json.dumps({
+            "schemaVersion": 1,
+            "autoswitch": {"modelThresholds": "Opus=60"},
+        }))
+        fake = FakeSwitcher(
+            [make_account(1, active=True), make_account(2)], tmp_path
+        )
+        app = make_app(fake)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await self._open(pilot)
+            screen = app.screen
+            await pilot.press("t")
+            await pilot.pause()
+            from textual.widgets import Static
+
+            from claude_swap.tui.autoview import ThresholdAdjustModal
+
+            assert isinstance(app.screen, ThresholdAdjustModal)
+            body = app.screen.query_one("#adjust-body", Static).render().plain
+            assert "▸ threshold" in body
+            assert "inherit (90%)" in body
+            # ↓ selects 5h; → leaves inherit and saves 91. Opus stays put.
+            await pilot.press("down", "right")
+            await pilot.pause()
+            assert screen._settings.threshold_5h == 91.0
+            assert screen._settings.threshold == 90.0
+            saved = _json.loads((tmp_path / "settings.json").read_text())
+            assert saved["autoswitch"]["threshold5h"] == 91.0
+            assert saved["autoswitch"]["modelThresholds"] == "Opus=60"
+            await pilot.press("down", "left")  # 7d → 89
+            await pilot.pause()
+            assert screen._settings.threshold_7d == 89.0
+            await pilot.press("down", "right")  # Fable → 91, Opus kept
+            await pilot.pause()
+            assert screen._settings.model_thresholds == "Opus=60,Fable=91"
+            await pilot.press("backspace")  # Fable back to inherit
+            await pilot.pause()
+            assert screen._settings.model_thresholds == "Opus=60"
+            body = app.screen.query_one("#adjust-body", Static).render().plain
+            assert "▸ Fable" in body
+            assert "inherit (90%)" in body
+            await pilot.press("enter")
+            await pilot.pause()
+            from claude_swap.tui.autoview import AutoScreen
+
+            assert isinstance(app.screen, AutoScreen)
+            assert fake_engine.instances[0].wakes == 1
+            # the shared line was never written; only the gates were
+            saved = _json.loads((tmp_path / "settings.json").read_text())
+            assert "threshold" not in saved["autoswitch"]
+
     async def test_candidates_ranked_by_headroom(self, tmp_path, fake_engine):
         fake = FakeSwitcher(
             [
@@ -2380,6 +2501,142 @@ class TestEventText:
         text = event_text(event, palette=Palette.from_theme(CSWAP_LIGHT))
         assert any(ACCENT_LIGHT in str(s.style) for s in text.spans)
 
+    def test_event_text_masks_mailboxes(self):
+        from claude_swap.autoswitch import QuarantineEvent
+        from claude_swap.tui.autoview import event_text
+
+        event = QuarantineEvent(
+            number="2", email="secret@example.com", reason="invalid_grant"
+        )
+        assert "secret@example.com" in event_text(event).plain
+        masked = event_text(event, mask=True).plain
+        assert "secret@example.com" not in masked
+        assert "s•••t@e•••.com" in masked
+
+
+@pytest.mark.asyncio
+class TestMaskToggle:
+    async def test_footer_shows_state_and_m_toggles_it(self, tmp_path):
+        app = make_app(
+            FakeSwitcher(
+                [make_account(1, active=True, email="alice@acme.com", alias="dev")],
+                tmp_path,
+            )
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountsPanel
+
+            assert "Mask off" in footer_labels(app.screen)
+            assert "alice@acme.com" in app.screen.query_one(AccountsPanel).render().plain
+            await pilot.press("m")
+            await settle(pilot)
+            assert "Mask on" in footer_labels(app.screen)
+            assert "Mask off" not in footer_labels(app.screen)
+            plain = app.screen.query_one(AccountsPanel).render().plain
+            assert "alice@acme.com" not in plain
+            assert "dev (a•••e@a•••.com)" in plain
+            assert json.loads((tmp_path / "settings.json").read_text())["ui"]["mask"] is True
+
+            await pilot.press("w")
+            from textual.widgets import Static
+
+            assert "Mask on" in await footer_after(pilot)
+            assert "masked" in app.screen.query_one("#list-title", Static).render().plain
+            await pilot.press("m")
+            await pilot.pause()
+            assert "Mask off" in await footer_after(pilot)
+            assert "masked" not in app.screen.query_one("#list-title", Static).render().plain
+
+    async def test_saved_mask_starts_on_in_the_footer(self, tmp_path):
+        (tmp_path / "settings.json").write_text(json.dumps({"ui": {"mask": True}}))
+        app = make_app(
+            FakeSwitcher([make_account(1, active=True, email="alice@acme.com")], tmp_path),
+            start="watch",
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await settle(pilot)
+            from claude_swap.tui.widgets import AccountCard
+
+            assert app.mask_accounts is True
+            assert "Mask on" in footer_labels(app.screen)
+            cards = "\n".join(card.render().plain for card in app.screen.query(AccountCard))
+            assert "alice@acme.com" not in cards
+            assert "a•••e@a•••.com" in cards
+
+    async def test_m_rewrites_the_open_remove_menu(self, tmp_path):
+        app = make_app(
+            FakeSwitcher(
+                [
+                    dataclasses.replace(
+                        make_account(1, active=True, email="plain@example.com"),
+                        org_name="Acme",
+                    )
+                ],
+                tmp_path,
+            )
+        )
+        async with app.run_test(size=(120, 36)) as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+
+            from claude_swap.tui.widgets import MenuItem
+
+            await menu_select(pilot, "remove-menu")
+            await pilot.press("m")
+            await settle(pilot)
+            labels = [
+                item.query_one(Static).render().plain
+                for item in app.screen.query_one("#menu", ListView).query(MenuItem)
+            ]
+            assert any("p•••n@e•••.com" in label for label in labels)
+            assert any("[A•••]" in label for label in labels)
+            assert not any("plain@example.com" in label for label in labels)
+            assert "Mask on" in footer_labels(app.screen)
+
+    async def test_auto_view_follows_the_footer_toggle(self, tmp_path, fake_engine):
+        app = make_app(
+            FakeSwitcher(
+                [
+                    make_account(1, active=True, email="active@acme.com"),
+                    make_account(2, email="other@acme.com"),
+                ],
+                tmp_path,
+            )
+        )
+        async with app.run_test(size=(120, 40)) as pilot:
+            await settle(pilot)
+            await pilot.press("g")
+            await settle(pilot)
+            from textual.widgets import RichLog, Static
+
+            from claude_swap.autoswitch import QuarantineEvent
+
+            await pilot.press("m")
+            await pilot.pause()
+            assert "Mask on" in footer_labels(app.screen)
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            summary = app.screen.query_one("#auto-summary", Static).render().plain
+            assert "other@acme.com" not in plain
+            assert "o•••r@a•••.com" in plain
+            assert "masked" in summary
+            app.screen._on_engine_event(
+                QuarantineEvent(
+                    number="2", email="other@acme.com", reason="invalid_grant"
+                )
+            )
+            log = app.screen.query_one("#event-log", RichLog)
+            logged = "\n".join(strip.text for strip in log.lines)
+            assert "other@acme.com" not in logged
+            assert "o•••r@a•••.com" in logged
+            await pilot.press("m")
+            await pilot.pause()
+            logged = "\n".join(strip.text for strip in log.lines)
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert "Mask off" in footer_labels(app.screen)
+            assert "other@acme.com" in plain
+            assert "other@acme.com" in logged
+
 
 # ---------------------------------------------------------------------------
 # accounts_snapshot on the real switcher
@@ -2491,6 +2748,41 @@ class TestSettingsMenu:
             assert app.threshold_pct == 90.0
             assert json.loads((tmp_path / "settings.json").read_text())["autoswitch"]["threshold"] == 90.0
 
+    async def test_gate_rows_cycle_and_persist(self, tmp_path):
+        (tmp_path / "settings.json").write_text(
+            json.dumps({"autoswitch": {"modelThresholds": "Opus=60"}})
+        )
+        fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+        app = make_app(fake)
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            from textual.widgets import ListView, Static
+            from claude_swap.tui.widgets import MenuItem
+
+            await menu_select(pilot, "settings-menu")
+            menu = app.screen.query_one("#menu", ListView)
+            labels = [item.query_one(Static).render().plain for item in menu.query(MenuItem)]
+            assert "5h gate: inherit (90%)" in labels
+            assert "Weekly gate: inherit (90%)" in labels
+            assert "Fable gate: inherit (90%)" in labels
+
+            await menu_select(pilot, "setting:threshold5h")
+            await menu_select(pilot, "setting:threshold7d")
+            await menu_select(pilot, "setting:fable")
+            saved = json.loads((tmp_path / "settings.json").read_text())["autoswitch"]
+            assert saved["threshold5h"] == 40.0
+            assert saved["threshold7d"] == 40.0
+            assert saved["modelThresholds"] == "Opus=60,Fable=40"
+
+            # The last stop wraps back to inherit, and Opus stays.
+            app._threshold_5h = 95.0
+            app._model_thresholds = "Opus=60,Fable=95"
+            await menu_select(pilot, "setting:threshold5h")
+            await menu_select(pilot, "setting:fable")
+            saved = json.loads((tmp_path / "settings.json").read_text())["autoswitch"]
+            assert "threshold5h" not in saved
+            assert saved["modelThresholds"] == "Opus=60"
+
     async def test_threshold_change_repaints_the_bar_tick_immediately(self, tmp_path):
         fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
         app = make_app(fake)
@@ -2601,3 +2893,147 @@ class TestThemeWiring:
             assert app._theme_name == "light"
             assert app.theme == "cswap-light"
             assert json.loads((tmp_path / "settings.json").read_text())["ui"]["theme"] == "light"
+
+
+@pytest.mark.asyncio
+async def test_menu_hover_and_keyboard_help_do_not_activate_option(tmp_path):
+    from textual.widgets import ListView, Static, Tooltip
+    from claude_swap.tui.widgets import MenuItem
+    from claude_swap.tui.modals import OutputModal
+    fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+    app = make_app(fake)
+    app.TOOLTIP_DELAY = 0.01
+    async with app.run_test(size=(110, 40), tooltips=True) as pilot:
+        await settle(pilot)
+        await menu_select(pilot, "settings-menu")
+        menu = app.screen.query_one("#menu", ListView)
+        item = next(i for i in menu.query(MenuItem) if i.action_id == "setting:threshold")
+        menu.index = list(menu.children).index(item)
+        assert all(i.tooltip for i in menu.query(MenuItem))
+        before = app.threshold_pct
+        await pilot.hover(item.query_one(Static))
+        await pilot.pause(0.1)
+        assert "utilization threshold" in str(app.screen.query_one(Tooltip).render())
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert isinstance(app.screen, OutputModal)
+        assert "utilization threshold" in app.screen._output
+        assert app.threshold_pct == before
+        await pilot.press("escape")
+        await pilot.pause()
+        assert menu.highlighted_child is item
+        assert not (tmp_path / "settings.json").exists()
+
+
+@pytest.mark.parametrize("sentinel", [None, USAGE_TOKEN_EXPIRED])
+def test_expiring_resets_stay_visible_in_both_themes_and_narrow_rows(sentinel):
+    from rich.console import Console
+    from claude_swap.tui.theme import CSWAP_LIGHT, Palette
+    from claude_swap.tui.widgets import account_card_text, mini_account_text
+    now = 1_700_000_000.0
+    expiry = datetime.fromtimestamp(now + 1800, timezone.utc).isoformat()
+    entry = UsageEntry(last_good={"reset_credits": {"available": 1, "expires_at": expiry}},
+                       fetched_at=now, sentinel=sentinel)
+    acc = make_account(1, entry=entry)
+    local = datetime.fromtimestamp(now + 1800).astimezone().strftime("%Y-%m-%d %H:%M %Z (%z)")
+    for palette in (Palette.DARK, Palette.from_theme(CSWAP_LIGHT)):
+        for text in (account_card_text(acc, 60, now=now, palette=palette),
+                     mini_account_text(acc, now, palette=palette)):
+            assert text.plain.count("earliest expires in 30m") == 1
+            assert local in text.plain
+            assert bool("last known" in text.plain) == bool(sentinel)
+            console = Console(width=40, record=True, force_terminal=False)
+            console.print(text)
+            rendered = console.export_text()
+            assert "…" not in rendered
+            assert "30m" in rendered
+            assert any(span.style == f"bold {palette.sev_crit}" for span in text.spans)
+
+
+@pytest.mark.asyncio
+async def test_two_expiring_minis_keep_local_times_in_narrow_panel(tmp_path):
+    from claude_swap.tui.widgets import AccountsPanel
+    now = time.time()
+    expiry = datetime.fromtimestamp(now + 1800, timezone.utc)
+    entry = UsageEntry(last_good={"reset_credits": {
+        "available": 1, "expires_at": expiry.isoformat()}}, fetched_at=now)
+    fake = FakeSwitcher([], tmp_path)
+    codex = FakeSwitcher([make_account(1, entry=entry), make_account(2, entry=entry)], tmp_path)
+    app = make_app(fake, codex=codex)
+    async with app.run_test(size=(40, 32)) as pilot:
+        await settle(pilot)
+        from textual.geometry import Region
+        widget = app.screen.query_one(AccountsPanel)
+        assert "\n\n 2" in widget.render().plain
+        strips = widget.render_lines(Region(0, 0, widget.outer_size.width, widget.outer_size.height))
+        visible = "".join("".join(strip.text for strip in strips).split())
+        clock = "".join(expiry.astimezone().strftime("%Y-%m-%d %H:%M %Z (%z)").split())
+        assert visible.count(clock) == 2
+        assert "usageunknown" not in visible
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('language,settings_label,remove_label', [
+    ('de', 'Einstellungen…', 'Entfernen'), ('el', 'Ρυθμίσεις…', 'Αφαίρεση'),
+])
+async def test_language_localizes_controls_but_keeps_actions_and_confirmation_safe(tmp_path, language, settings_label, remove_label):
+    from textual.widgets import Static, Button
+    from claude_swap.tui.widgets import MenuItem
+    (tmp_path / 'settings.json').write_text(json.dumps({'ui': {'language': language}}))
+    fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+    app = make_app(fake)
+    async with app.run_test(size=(80, 32)) as pilot:
+        await settle(pilot)
+        labels = [str(row.query_one(Static).render()) for row in app.screen.query(MenuItem)]
+        assert any(settings_label in label for label in labels)
+        await menu_select(pilot, 'settings-menu')
+        assert app.screen._menu_stack[-1][0] == 'settings'
+        await menu_select(pilot, 'setting:mask')
+        assert json.loads((tmp_path / 'settings.json').read_text())['ui']['mask'] is True
+        await menu_select(pilot, 'setting:language')
+        assert app._language_name != language
+        assert json.loads((tmp_path / "settings.json").read_text())["ui"]["language"] == app._language_name
+        # A saved language does not mutate the running app's translator.
+        assert app.gettext('Settings…') == settings_label
+        app.confirm_remove('claude', '1', 'fake@example.com')
+        await pilot.pause()
+        assert str(app.screen.query_one('#yes', Button).label) == remove_label
+        await pilot.press('n')
+        await pilot.pause()
+        assert not any(call[0] == 'remove' for call in fake.calls)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('key,confirmed', [('n', False), ('y', True)])
+async def test_confirmation_translates_once_and_keeps_yes_no_keys(tmp_path, key, confirmed):
+    from textual.widgets import Button
+    fake = FakeSwitcher([make_account(1, active=True)], tmp_path)
+    app = make_app(fake)
+    app.gettext = lambda text: {'Remove': 'Entfernen', 'Entfernen': 'wrong second translation'}.get(text, text)
+    async with app.run_test() as pilot:
+        await settle(pilot)
+        app.confirm_remove('claude', '1', 'fake@example.com')
+        await pilot.pause()
+        assert str(app.screen.query_one('#yes', Button).label) == 'Entfernen'
+        await pilot.press(key)
+        await settle(pilot)
+        assert any(call[0] == 'remove' for call in fake.calls) is confirmed
+
+
+def test_translated_quota_labels_preserve_window_ids_and_spend_countdowns():
+    from claude_swap.tui.widgets import account_card_text, mini_account_text
+    now = 1_700_000_000.0
+    seen = []
+    entry = UsageEntry(last_good={
+        'weekly': {'pct': 42.0},
+        'spend': {'pct': 30.0, 'used': 3.0, 'limit': 10.0, 'resets_at': datetime.fromtimestamp(now + 3600, timezone.utc).isoformat()},
+    }, fetched_at=now)
+    translate = lambda text: {'Weekly': 'Woche', 'resets {duration}': 'Reset in {duration}'}.get(text, text)
+    def threshold(window):
+        seen.append(window)
+        return None
+    account = make_account(1, entry=entry)
+    card = account_card_text(account, 100, now=now, tr=translate, threshold_for=threshold).plain
+    assert 'Weekly' in seen and 'Woche' not in seen
+    assert 'Woche' in card and 'Reset in 1h' in card
+    assert 'Woche' in mini_account_text(account, now, tr=translate).plain

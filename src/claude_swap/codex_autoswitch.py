@@ -15,6 +15,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from claude_swap import oauth
 from claude_swap.autoswitch import (
     AllExhaustedEvent,
     AutoSwitchEvent,
@@ -27,7 +28,8 @@ from claude_swap.autoswitch import (
 )
 from claude_swap.codex import CodexAccountSwitcher, _codex_restart_hint
 from claude_swap.locking import FileLock
-from claude_swap.settings import AutoSwitchSettings, atomic_write_json
+from claude_swap.poll_policy import parse_reset_ts
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json, gate_thresholds
 
 STATE_FILENAME = "codex_autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -35,6 +37,23 @@ STATE_SCHEMA_VERSION = 1
 
 def _ref(number: str, email: str) -> dict:
     return {"number": int(number), "email": email}
+
+
+def _codex_gates(settings: AutoSwitchSettings) -> dict[str, float]:
+    # Claude's 7d gate maps to Codex Weekly; model gates do not apply to Codex.
+    return {
+        ("weekly" if label == "7d" else label): pct
+        for label, pct in gate_thresholds(settings).overrides.items()
+        if label in ("5h", "7d")
+    }
+
+
+def _weekly_reset(usage: dict | None, now: float) -> float | None:
+    for label, _, resets_at in oauth.relevant_windows(usage):
+        if label == "Weekly":
+            ts = parse_reset_ts(resets_at)
+            return ts if ts is not None and ts > now else None
+    return None
 
 
 class CodexAutoSwitchEngine:
@@ -141,19 +160,32 @@ class CodexAutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
-        active_pct = 100.0 - active_headroom
-        if active_pct < self.settings.threshold:
-            self._emit(
-                NoSwitchEvent(
-                    reason="below-threshold",
-                    detail=f"{active_pct:.0f}% < {self.settings.threshold:.0f}%",
-                )
+        overrides = _codex_gates(self.settings)
+        policy = {
+            number: binding_pct(
+                value,
+                gate_thresholds=overrides,
+                default_threshold=self.settings.threshold,
             )
-            return TickOutcome.NO_ACTION
-        trigger = "at-limit" if active_headroom <= 0 else "proactive"
+            for number, value in usage.items()
+        }
+        active_pct = policy[current]
+        below_threshold = active_pct < self.settings.threshold
+        now = self.clock()
+        resets = {number: _weekly_reset(value, now) for number, value in usage.items()}
+        active_reset = resets[current]
+
+        if below_threshold:
+            if self.settings.strategy != "consume-first" or active_reset is None:
+                return self._below_threshold(usage[current], active_headroom, overrides)
+            # Burn the soonest-expiring weekly quota first. Only a strictly sooner
+            # reset moves, so consume-first cannot ping-pong between accounts.
+            trigger = "consume-first"
+        else:
+            trigger = "at-limit" if active_headroom <= 0 else "proactive"
 
         state = self._read_state()
-        if trigger == "proactive" and self._in_cooldown(state):
+        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -166,6 +198,8 @@ class CodexAutoSwitchEngine:
             and not account.disabled
         ]
         if not candidates:
+            if below_threshold:
+                return self._below_threshold(usage[current], active_headroom, overrides)
             self._emit(NoSwitchEvent(reason="no-candidates"))
             return TickOutcome.BLOCKED
 
@@ -175,16 +209,30 @@ class CodexAutoSwitchEngine:
             candidate_headroom = headroom[account.number]
             if candidate_headroom is None or candidate_headroom <= 0:
                 continue
-            candidate_pct = 100.0 - candidate_headroom
+            candidate_pct = policy[account.number]
             if trigger == "proactive" and (
                 candidate_pct > hysteresis_bar
-                or candidate_headroom <= active_headroom
+                or candidate_pct >= active_pct
             ):
                 continue
-            qualifying.append((candidate_headroom, account.number))
+            if trigger == "consume-first":
+                reset = resets[account.number]
+                if (
+                    candidate_pct >= self.settings.threshold
+                    or reset is None
+                    or reset >= active_reset
+                ):
+                    continue
+            qualifying.append((100.0 - candidate_pct, account.number))
         qualifying.sort(reverse=True)
+        if self.settings.strategy == "consume-first":
+            qualifying.sort(
+                key=lambda item: resets[item[1]] or float("inf")
+            )
 
         if not qualifying:
+            if below_threshold:
+                return self._below_threshold(usage[current], active_headroom, overrides)
             if all(
                 candidate_headroom is not None and candidate_headroom <= 0
                 for candidate_headroom in (headroom[account.number] for account in candidates)
@@ -196,6 +244,22 @@ class CodexAutoSwitchEngine:
 
         target = accounts[qualifying[0][1]]
         return self._perform(current, active.email, target.number, target.email, trigger)
+
+    def _below_threshold(
+        self, usage: dict, active_headroom: float, overrides: dict[str, float]
+    ) -> TickOutcome:
+        detail = f"{100.0 - active_headroom:.0f}% < {self.settings.threshold:.0f}%"
+        if overrides:
+            label, pct, _ = min(
+                oauth.relevant_windows(usage),
+                key=lambda w: (
+                    overrides.get(w[0].lower(), self.settings.threshold) - w[1], -w[1]
+                ),
+            )
+            threshold = overrides.get(label.lower(), self.settings.threshold)
+            detail = f"{label} {pct:.0f}% < {threshold:.0f}%"
+        self._emit(NoSwitchEvent(reason="below-threshold", detail=detail))
+        return TickOutcome.NO_ACTION
 
     def _perform(
         self,
@@ -219,7 +283,7 @@ class CodexAutoSwitchEngine:
 
         with self._state_lock():
             state = self._read_state()
-            if trigger == "proactive" and self._in_cooldown(state):
+            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
             result = self.switcher.switch_to(target, json_output=True)

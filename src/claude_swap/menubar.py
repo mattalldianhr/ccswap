@@ -38,7 +38,7 @@ REFRESH_CHOICES: tuple[int, ...] = (30, 60, 300)
 AUTO_THRESHOLD_CHOICES: tuple[int, ...] = (80, 90, 95, 98)
 TITLE_PCT_CHOICES: tuple[str, ...] = ("off", "5h", "7d", "both")
 SWITCH_HISTORY_LIMIT = 10
-NOTIFICATION_BUNDLE_ID = "com.claude-swap.menubar"
+NOTIFICATION_BUNDLE_ID = "com.ccswap.menubar"
 
 
 def ensure_notification_identity(
@@ -48,9 +48,11 @@ def ensure_notification_identity(
 ) -> Path | None:
     """Ensure rumps can resolve a bundle identifier for notifications.
 
-    Command-line Python tools have no app bundle, so rumps looks for an
-    ``Info.plist`` beside the interpreter. uv/pipx reinstalls can recreate that
-    environment; repair the tiny plist on every launch when needed.
+    Fallback for runs outside the wrapper bundle (``claude_swap.app_bundle``),
+    whose Info.plist already carries the identifier: a bare command-line
+    interpreter has no app bundle, so rumps looks for an ``Info.plist`` beside
+    it. uv/pipx reinstalls can recreate that environment; repair the tiny
+    plist on every launch when needed.
     """
     if platform != "darwin":
         return None
@@ -574,14 +576,6 @@ def framework_build_warning(
 
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
-    ensure_notification_identity()
-    _warn = framework_build_warning()
-    if _warn:
-        # stderr, not stdout: launchd sends stdout to the .log file where it
-        # would sit in a block buffer for the life of the process, and the
-        # install output points the user at the .err file anyway. stderr stays
-        # line-buffered even when redirected, so it lands immediately.
-        warning(_warn, file=sys.stderr)
     try:
         import rumps  # lazy: optional dependency, imported only when launching
         import AppKit  # ships with rumps (pyobjc-framework-Cocoa), never fails alone
@@ -594,6 +588,23 @@ def run(switcher) -> int:
             "Menu bar mode requires 'rumps'. "
             "Install with: pip install 'ccswap[menubar]'"
         ) from e
+
+    from claude_swap import app_bundle
+
+    # Hop into the wrapper .app before anything AppKit-side is set up, so the
+    # status item's owner has a bundle identifier that menu bar managers can
+    # key on. Returns only when staying in this interpreter (already bundled,
+    # opted out, framework build, or the bundle could not be built).
+    app_bundle.maybe_reexec(switcher.backup_dir)
+    if not app_bundle.in_bundle():
+        ensure_notification_identity()
+    _warn = framework_build_warning()
+    if _warn:
+        # stderr, not stdout: launchd sends stdout to the .log file where it
+        # would sit in a block buffer for the life of the process, and the
+        # install output points the user at the .err file anyway. stderr stays
+        # line-buffered even when redirected, so it lands immediately.
+        warning(_warn, file=sys.stderr)
 
     # rumps never sets an activation policy, so under a framework Python the
     # process launches as a regular app and parks a "Python" icon in the Dock
@@ -657,7 +668,15 @@ def run(switcher) -> int:
                 self._codex_auth_mtime = 0.0
             self._codex_engine = None
             self._codex_engine_events: list = []
+            # Claude Code integrations: live state read off the main thread
+            # (`claude plugin list` takes about a second); None until known.
+            # A finished toggle leaves (ok, message) in _claude_note for the
+            # sync tick to show on the main thread.
+            self._claude_state = {"claude.statusline": None, "claude.mod": None}
+            self._claude_busy = False
+            self._claude_note = None
             self.rebuild_menu()
+            self._start_claude_work()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
             self.refresh_timer = rumps.Timer(self.on_refresh_tick, self.settings.refresh_interval)
@@ -743,6 +762,13 @@ def run(switcher) -> int:
             if self._dirty:
                 self._dirty = False
                 self.rebuild_menu()
+            note, self._claude_note = self._claude_note, None
+            if note is not None:
+                ok, message = note
+                if ok:
+                    rumps.notification("ccswap", "Claude Code", message)
+                else:
+                    rumps.alert(title="ccswap", message=message)
             self._detect_active_change()
             self._detect_codex_active_change()
             self._drain_engine_events()
@@ -1147,6 +1173,19 @@ def run(switcher) -> int:
                 threshold_menu.add(ch)
             menu.add(threshold_menu)
 
+            for key, label in (
+                ("claude.statusline", "Claude statusline"),
+                ("claude.mod", "Claude Code mod"),
+            ):
+                state = self._claude_state[key]
+                known = state is not None and not self._claude_busy
+                item = rumps.MenuItem(
+                    label if known else f"{label} (checking…)",
+                    callback=self._make_claude_toggle(key) if known else None,
+                )
+                item.state = 1 if state else 0
+                menu.add(item)
+
             return menu
 
         # ---- callbacks --------------------------------------------------------
@@ -1363,6 +1402,33 @@ def run(switcher) -> int:
             else:
                 self._stop_codex_engine()
             self.rebuild_menu()
+
+        def _start_claude_work(self, key=None, on=False):
+            self._claude_busy = True
+            threading.Thread(
+                target=self._claude_work, args=(key, on), daemon=True
+            ).start()
+
+        def _claude_work(self, key, on):
+            from claude_swap.claude_integration import is_enabled, set_enabled
+
+            try:
+                if key is not None:
+                    try:
+                        message = set_enabled(self.switcher.backup_dir, key, on)
+                        self._claude_note = (True, message)
+                    except Exception as e:
+                        self._claude_note = (False, f"Couldn't change {key}: {e}")
+                self._claude_state = {k: is_enabled(k) for k in self._claude_state}
+            finally:
+                self._claude_busy = False
+                self._dirty = True  # rebuilt by on_sync_tick on the main thread
+
+        def _make_claude_toggle(self, key):
+            def cb(_sender):
+                self._start_claude_work(key, not self._claude_state[key])
+                self.rebuild_menu()
+            return cb
 
         def _make_threshold(self, pct):
             def cb(_sender):

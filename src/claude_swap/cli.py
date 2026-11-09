@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
 from claude_swap import __version__, paths, printer
 from claude_swap.codex import CodexAccountSwitcher
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.agy import AgyAccountSwitcher
+from claude_swap.exceptions import ClaudeSwitchError, ConfigError
 from claude_swap.json_output import error_envelope
+from claude_swap.models import Platform
 from claude_swap.printer import (
     accent,
     bolded,
@@ -20,7 +23,7 @@ from claude_swap.printer import (
     muted,
     warning,
 )
-from claude_swap.settings import load_ui_settings
+from claude_swap.settings import load_run_settings, load_ui_settings, load_update_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -61,6 +64,7 @@ _SUBCOMMAND_FLAGS = {
     "enable": "--enable-account",
     "export": "--export",
     "import": "--import",
+    "import-usage": "--import-usage",
     "purge": "--purge",
     "upgrade": "--upgrade",
     "update": "--upgrade",
@@ -148,7 +152,7 @@ Examples:
         "--no-share",
         action="store_true",
         help=(
-            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents "
+            "Don't share settings/keybindings/CLAUDE.md/skills/commands/agents/rules "
             "from ~/.claude into the session profile (and remove previously "
             "shared items)"
         ),
@@ -156,13 +160,14 @@ Examples:
     parser.add_argument(
         "--share-history",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=None,
         help=(
             "Share conversation history (projects/ and history.jsonl) from "
             "~/.claude into the session profile, so every account sees one "
             "unified history. History the profile already accumulated is "
             "merged into ~/.claude first. --no-share-history restores "
-            "per-account history (the default). Not supported on Windows."
+            "per-account history (the default, unless `ccswap config set "
+            "run.shareHistory true`). Not supported on Windows."
         ),
     )
     parser.add_argument(
@@ -190,11 +195,12 @@ Examples:
         manager = SessionManager(switcher)
 
         if args.account is not None:
+            _refuse_session_in_file_backend(switcher)
             manager.run(
                 args.account,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests where exec/exit is mocked
@@ -202,11 +208,12 @@ Examples:
         # No account given: resolve from the current directory's mapping.
         slot, email = switcher.slot_for_directory(os.getcwd())
         if slot is not None:
+            _refuse_session_in_file_backend(switcher)
             manager.run(
                 slot,
                 tail,
                 share=not args.no_share,
-                share_history=args.share_history,
+                share_history=_resolve_share_history(args, switcher),
                 require_session=args.require_session,
             )
             return  # only reachable in tests
@@ -229,6 +236,38 @@ Examples:
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+
+
+def _refuse_session_in_file_backend(switcher: ClaudeAccountSwitcher) -> None:
+    """Session profiles keep their credentials in the macOS Keychain, which the
+    file backend promises never to touch, so refuse before starting one."""
+    from claude_swap.models import Platform
+
+    if switcher.platform == Platform.MACOS and switcher.credential_backend == "file":
+        raise ConfigError(
+            "ccswap run (session mode) needs the macOS Keychain and is not "
+            "supported with credentials.backend file. Use `ccswap switch` instead."
+        )
+
+
+def _resolve_share_history(args: argparse.Namespace, switcher) -> bool:
+    """The flag wins; otherwise run.shareHistory, which Windows can't honor.
+
+    An explicit --share-history still reaches SessionManager.run and errors
+    there; a setting-derived one just warns and falls back to per-account
+    history. Only called on account-targeting paths, so a bare unmapped run
+    (plain claude) stays silent.
+    """
+    if args.share_history is not None:
+        return args.share_history
+    enabled = load_run_settings(switcher.backup_dir).share_history
+    if enabled and switcher.platform == Platform.WINDOWS:
+        warning(
+            "run.shareHistory is not supported on Windows yet — "
+            "using per-account history."
+        )
+        return False
+    return enabled
 
 
 def _guard_root(switcher: ClaudeAccountSwitcher) -> None:
@@ -575,9 +614,63 @@ Examples:
         sys.exit(130)
 
 
+class _CodexRunParser(argparse.ArgumentParser):
+    """Keep wrapper help on stderr and invalid arguments out of diagnostics."""
+
+    def _print_message(self, message, file=None) -> None:
+        super()._print_message(message, sys.stderr)
+
+    def error(self, message) -> None:
+        super().error("Invalid Codex run arguments; wrapper options must precede --.")
+
+
+def _agy_command(argv: list[str]) -> None:
+    parser = argparse.ArgumentParser(prog=f"{_prog_name()} agy")
+    commands = parser.add_subparsers(dest="action", required=True)
+    for action in ("list", "status", "usage"):
+        commands.add_parser(action).add_argument("--json", action="store_true")
+    commands.add_parser("add")
+    switch = commands.add_parser("switch")
+    switch.add_argument("account", metavar="NUM|EMAIL")
+    switch.add_argument("--json", action="store_true")
+    remove = commands.add_parser("remove")
+    remove.add_argument("account", metavar="NUM|EMAIL")
+    remove.add_argument("--yes", action="store_true")
+    args = parser.parse_args(argv)
+    switcher = AgyAccountSwitcher()
+    try:
+        if args.action == "add":
+            switcher.add_account()
+        elif args.action == "remove":
+            switcher.remove_account(args.account, assume_yes=args.yes)
+        elif args.action == "switch":
+            payload = switcher.switch_to(args.account, json_output=args.json)
+            if args.json:
+                print(json.dumps(payload, indent=2))
+        else:
+            method = {"list": switcher.list_accounts, "status": switcher.status,
+                      "usage": switcher.usage_status}[args.action]
+            method(json_output=args.json)
+    except ClaudeSwitchError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(exc)))
+        else:
+            error(f"Error: {exc}")
+        sys.exit(1)
+    except OSError:
+        exc = ClaudeSwitchError("Cannot access Antigravity account storage")
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(exc)))
+        else:
+            error(str(exc))
+        sys.exit(1)
+
+
 def _codex_command(argv: list[str]) -> None:
     """Handle ``cswap codex`` account management commands."""
-    parser = argparse.ArgumentParser(
+    is_run = next((arg for arg in argv if not arg.startswith("-")), None) == "run"
+    parser_type = _CodexRunParser if is_run else argparse.ArgumentParser
+    parser = parser_type(
         prog=f"{_prog_name()} codex",
         description=(
             "Manage file-backed Codex CLI accounts. Run 'codex login' for an "
@@ -593,11 +686,36 @@ def _codex_command(argv: list[str]) -> None:
     ):
         command = subcommands.add_parser(name, help=help_text)
         command.add_argument("--json", action="store_true")
+    run = subcommands.add_parser("run", help="Run Codex as a saved account", allow_abbrev=False)
+    run.add_argument("account", nargs="?", metavar="NUM|EMAIL")
+    run.add_argument("--require-session", action="store_true",
+                     help="Refuse the unisolated default-login shortcut")
+    run.add_argument("--shared", action="store_true",
+                     help="Join a live session, accepting refresh-token races")
+
+
+    redeem = subcommands.add_parser(
+        "redeem-reset", help="Redeem one banked reset for a saved Codex account"
+    )
+    redeem.add_argument("account", metavar="NUM|EMAIL")
+    redeem.add_argument("--yes", action="store_true", help="Skip confirmation")
+    redeem.add_argument("--json", action="store_true")
     add = subcommands.add_parser("add", help="Save the current Codex login")
     add.add_argument("--slot", type=int, metavar="N")
     switch = subcommands.add_parser("switch", help="Switch to the next or named Codex account")
     switch.add_argument("account", nargs="?", metavar="NUM|EMAIL")
     switch.add_argument("--json", action="store_true")
+    switch.add_argument(
+        "--strategy",
+        choices=["best", "next-available", "consume-first"],
+        help=(
+            "With bare 'switch': pick the Codex target by remaining 5h/Weekly quota. "
+            "'best' jumps to the account with the most headroom; "
+            "'next-available' rotates to the next account, skipping any at their limit; "
+            "'consume-first' jumps to the account with headroom whose weekly "
+            "window resets soonest, so no quota is lost at a reset"
+        ),
+    )
     remove = subcommands.add_parser("remove", help="Remove a saved Codex account")
     remove.add_argument("account", metavar="NUM|EMAIL")
     remove.add_argument("--yes", action="store_true", help="Skip confirmation")
@@ -615,9 +733,27 @@ def _codex_command(argv: list[str]) -> None:
     auto.add_argument("--threshold", type=float, metavar="PCT")
     auto.add_argument("--cooldown", type=float, metavar="SECONDS")
     auto.add_argument("--dry-run", action="store_true", help="Report decisions without switching")
-    args = parser.parse_args(argv)
+    boundary = argv.index("--") if "--" in argv else len(argv)
+    # Keep the child tail out of parsing and diagnostics.
+    args = parser.parse_args(argv[:boundary] if is_run else argv)
+    codex_args = argv[boundary + 1:]
+    if args.action == "switch" and args.account and args.strategy:
+        parser.error("--strategy can only be used with bare 'switch'")
+
+    if args.action == "redeem-reset" and args.json and not args.yes:
+        parser.error("--json requires --yes")
 
     try:
+        if args.action == "run":
+            from pathlib import Path
+
+            from claude_swap.codex_session import refuse_inherited_home, run_session
+
+            refuse_inherited_home(os.environ)
+            switcher = CodexAccountSwitcher(debug=args.debug)
+            sys.exit(run_session(switcher, args.account, require_session=args.require_session,
+                                 shared=args.shared, codex_args=codex_args,
+                                 env=os.environ, cwd=Path.cwd()))
         switcher = CodexAccountSwitcher(debug=args.debug)
         if args.action == "list":
             switcher.list_accounts(json_output=args.json)
@@ -625,6 +761,8 @@ def _codex_command(argv: list[str]) -> None:
             switcher.status(json_output=args.json)
         elif args.action == "usage":
             switcher.usage_status(json_output=args.json)
+        elif args.action == "redeem-reset":
+            switcher.redeem_reset(args.account, assume_yes=args.yes, json_output=args.json)
         elif args.action == "add":
             switcher.add_account(slot=args.slot)
         elif args.action == "remove":
@@ -667,12 +805,23 @@ def _codex_command(argv: list[str]) -> None:
                 )
             signal.signal(signal.SIGTERM, lambda *_: engine.stop())
             sys.exit(engine.run_loop())
-        elif args.account:
-            switcher.switch_to(args.account, json_output=args.json)
         else:
-            switcher.switch(json_output=args.json)
+            if args.account:
+                result = switcher.switch_to(args.account, json_output=args.json)
+            else:
+                result = switcher.switch(strategy=args.strategy, json_output=args.json)
+            if args.json:
+                print(json.dumps(result, indent=2))
     except ClaudeSwitchError as exc:
-        error(f"Error: {exc}")
+        if getattr(args, "json", False):
+            print(json.dumps(error_envelope(exc)))
+        else:
+            error(f"Error: {exc}")
+        sys.exit(1)
+    except OSError:
+        if args.action != "run":
+            raise
+        error("Cannot initialize the Codex run; no new session writer started.")
         sys.exit(1)
 
 
@@ -734,11 +883,17 @@ def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | Non
 
     A single provider in ``--json`` mode returns that provider's bare payload,
     so scripts on the old Claude-only ``list --json`` migrate by adding
-    ``--provider claude``. ``all`` (the default) nests both under
-    ``claude``/``codex`` keys. Human mode prints one section per provider and
+    ``--provider claude``. ``all`` (the default) nests providers under
+    ``claude``/``codex``/``agy`` keys. Human mode prints one section per provider and
     never triggers Claude's interactive first-run inside the merged view.
     """
     provider = args.provider
+    if provider == "agy":
+        agy = AgyAccountSwitcher()
+        if args.json:
+            return agy.list_payload()
+        agy.list_accounts()
+        return None
     if provider == "claude":
         return claude_switcher.list_accounts(
             show_token_status=args.token_status, json_output=args.json
@@ -751,12 +906,12 @@ def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | Non
         codex_switcher.list_accounts(json_output=False)
         return None
 
-    # provider == "all": merge both providers.
     if args.json:
         claude_payload = claude_switcher.list_accounts(
             show_token_status=args.token_status, json_output=True
         )
-        return {"claude": claude_payload, "codex": codex_switcher.list_payload()}
+        return {"claude": claude_payload, "codex": codex_switcher.list_payload(),
+                "agy": AgyAccountSwitcher().list_payload()}
 
     print(bolded("Claude Code"))
     if claude_switcher.sequence_file.exists():
@@ -768,7 +923,28 @@ def _list_dispatch(claude_switcher: "ClaudeAccountSwitcher", args) -> dict | Non
     print()
     print(bolded("Codex"))
     codex_switcher.list_accounts(json_output=False)
+    print()
+    print(bolded("Antigravity"))
+    AgyAccountSwitcher().list_accounts()
     return None
+
+
+def _gate_banner(settings) -> str:
+    """Suffix for the auto-loop banner when any gate has its own threshold."""
+    from claude_swap.settings import parse_model_thresholds
+
+    parts = []
+    if settings.threshold_5h is not None:
+        parts.append(f"5h {settings.threshold_5h:g}%")
+    if settings.threshold_7d is not None:
+        parts.append(f"7d {settings.threshold_7d:g}%")
+    if settings.weekly_threshold is not None:
+        parts.append(f"weekly {settings.weekly_threshold:g}%")
+    for name, pct in parse_model_thresholds(settings.model_thresholds):
+        parts.append(f"{name} {pct:g}%")
+    if not parts:
+        return ""
+    return ", gates " + " / ".join(parts)
 
 
 def _auto_command(argv: list[str]) -> None:
@@ -800,12 +976,14 @@ Exit codes with --once:
   3  blocked: wanted to switch but no viable target / all exhausted
 
 Examples:
-  ccswap auto                       # foreground loop, switch at 90%% used
+  ccswap auto                       # foreground loop, switch at 90% used
   ccswap auto --threshold 80        # switch earlier
+  ccswap auto --weekly-threshold 97 # let the 7d/model windows run higher
   ccswap auto --model Fable         # also switch when the Fable weekly limit is hit
   ccswap auto --json                # one JSON event per line (for scripts)
   ccswap auto --once; echo $?       # single tick, outcome in exit code
   ccswap auto --dry-run             # log decisions, never actually switch
+  ccswap auto --install-service     # run at every login via launchd (macOS)
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -836,6 +1014,16 @@ Defaults live in settings.json in the backup root; flags override them.
         ),
     )
     parser.add_argument(
+        "--weekly-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Gate for the 7d and per-model windows, below threshold7d/"
+            "modelThresholds (50-99.9; default: the threshold). A flag cannot "
+            "unset a configured value; use 'ccswap config unset'"
+        ),
+    )
+    parser.add_argument(
         "--cooldown",
         type=float,
         metavar="SECONDS",
@@ -849,6 +1037,29 @@ Defaults live in settings.json in the backup root; flags override them.
             "account-wide 5h/7d windows. One name or a comma-separated list "
             "(e.g. Fable, Opus, Sonnet, Haiku, or 'Fable,Opus'), or 'all' "
             "for every per-model window an account reports"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-5h",
+        type=float,
+        metavar="PCT",
+        help=(
+            "5h gate (1.0-99.9). Unset uses --threshold. Any gate tripping "
+            "switches, even if the others are fine"
+        ),
+    )
+    parser.add_argument(
+        "--threshold-7d",
+        type=float,
+        metavar="PCT",
+        help="Weekly (7d) gate (1.0-99.9). Unset uses --threshold",
+    )
+    parser.add_argument(
+        "--model-thresholds",
+        metavar="NAME=PCT",
+        help=(
+            "Per-model gates, e.g. Fable=40 or Fable=40,Opus=70. A named "
+            "model is watched even without --model; any gate tripping switches"
         ),
     )
     parser.add_argument(
@@ -880,7 +1091,35 @@ Defaults live in settings.json in the backup root; flags override them.
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--install-service",
+        action="store_true",
+        help=(
+            "Install a launchd LaunchAgent so auto-switching starts at login "
+            "and restarts on crash (macOS)"
+        ),
+    )
+    parser.add_argument(
+        "--uninstall-service",
+        action="store_true",
+        help="Stop the LaunchAgent and remove its plist (macOS)",
+    )
+    parser.add_argument(
+        "--service-status",
+        action="store_true",
+        help="Report whether the LaunchAgent is installed and running",
+    )
     args = parser.parse_args(argv)
+
+    service_action = args.install_service or args.uninstall_service or args.service_status
+    if service_action:
+        # The agent runs a bare `auto`, so anything else on this command line
+        # would be dropped without a word.
+        if len(argv) != 1:
+            parser.error(
+                "service flags take no other options; the service reads "
+                "settings.json, so use 'ccswap config set' for thresholds"
+            )
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
@@ -907,6 +1146,9 @@ Defaults live in settings.json in the backup root; flags override them.
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        if service_action:
+            sys.exit(_auto_service(args))
+
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
         engine = AutoSwitchEngine(
             switcher,
@@ -925,6 +1167,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 dimmed(
                     f"Auto-switch running: threshold {settings.threshold:.0f}%, "
                     f"every {settings.interval_seconds:.0f}s"
+                    f"{_gate_banner(settings)}"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
             )
@@ -953,9 +1196,11 @@ def _config_command(argv: list[str]) -> None:
     loudly here instead of silently degrading at `cswap auto` time.
     """
     from claude_swap.settings import (
+        ACTION_KEYS,
         SETTING_SPECS,
         effective_settings,
         format_setting_value,
+        parse_setting_value,
         set_setting,
         setting_spec,
         settings_path,
@@ -981,7 +1226,10 @@ Examples:
   ccswap config                              # list effective settings
   ccswap config get autoswitch.threshold
   ccswap config set autoswitch.threshold 80
+  ccswap config set autoswitch.weeklyThreshold 97  # 7d/model gate (threshold7d wins)
   ccswap config unset autoswitch.threshold   # back to the default
+  ccswap config set claude.statusline on     # ccswap statusline in Claude Code
+  ccswap config set claude.mod on            # install the ccswap mod
   ccswap config path                         # where settings.json lives
         """,
     )
@@ -1053,7 +1301,7 @@ Examples:
         elif action == "get":
             spec = setting_spec(args.key)
             value, is_set = next(
-                (v, s) for sp, v, s in effective_settings(root) if sp is spec
+                (v, s) for sp, v, s in effective_settings(root, spec.dotted) if sp is spec
             )
             if json_mode:
                 payload = {
@@ -1065,13 +1313,42 @@ Examples:
                 print(json.dumps(payload, indent=2))
             else:
                 print(format_setting_value(value))
+        elif action in ("set", "unset") and args.key in ACTION_KEYS:
+            # Action keys install/uninstall; unset means back to the default, off.
+            from claude_swap.claude_integration import set_enabled
+
+            on = action == "set" and parse_setting_value(setting_spec(args.key), args.value)
+            print(set_enabled(root, args.key, on))
         elif action == "set":
+            if args.key == "credentials.backend":
+                backend = parse_setting_value(setting_spec(args.key), args.value)
+                if backend == "file":
+                    switcher._refuse_incomplete_file_backend()
+                else:
+                    switcher._refuse_leaving_file_backend()
             value = set_setting(root, args.key, args.value)
             print(f"{args.key} = {format_setting_value(value)}")
+            if args.key == "credentials.backend":
+                # Switchers intentionally pin this setting at construction. For
+                # this just-completed command, update the local view so the
+                # post-write residual warning reflects the new value.
+                switcher.credential_backend = value
+                switcher._warn_residual_keychain_items()
+                print(dimmed(
+                    "Restart any running ccswap auto, menubar, or TUI instance "
+                    "to use the new credential backend."
+                ))
         elif action == "unset":
+            if args.key == "credentials.backend":
+                switcher._refuse_leaving_file_backend()
             if unset_setting(root, args.key):
                 default = setting_spec(args.key).default
                 print(f"{args.key} unset (default: {format_setting_value(default)})")
+                if args.key == "credentials.backend":
+                    print(dimmed(
+                        "Restart any running ccswap auto, menubar, or TUI instance "
+                        "to use the new credential backend."
+                    ))
             else:
                 print(muted(f"{args.key} is not set; nothing to do"), file=sys.stderr)
     except ClaudeSwitchError as e:
@@ -1157,14 +1434,53 @@ def _menubar_service(args) -> int:
             print("Menu bar service was not installed.")
         return 0
 
-    result = launch_agent.status()
+    return _print_service_status(launch_agent.status(), "Menu bar", "menubar")
+
+
+def _auto_service(args) -> int:
+    """Handle ``auto --install-service|--uninstall-service|--service-status``."""
+    from claude_swap import launch_agent
+
+    label = launch_agent.AUTO_LABEL
+    if args.install_service:
+        result = launch_agent.install(label=label)
+        print(f"Auto-switch service installed ({result['label']}).")
+        print(f"  plist: {result['plist']}")
+        print(f"  logs:  {result['stdout_log']}")
+        print(
+            dimmed(
+                "It starts at login from now on. Re-run this after a ccswap "
+                "upgrade to point launchd at the new build."
+            )
+        )
+        if launch_agent.is_loaded():
+            # The menu bar's Auto-switch toggle runs an engine of its own.
+            warning(
+                "The menu bar service is also installed. If its Auto-switch "
+                "toggle is on, turn it off so only one engine is polling.",
+                file=sys.stderr,
+            )
+        return 0
+
+    if args.uninstall_service:
+        result = launch_agent.uninstall(label=label)
+        if result["was_loaded"] or result["removed_plist"]:
+            print("Auto-switch service removed.")
+        else:
+            print("Auto-switch service was not installed.")
+        return 0
+
+    return _print_service_status(launch_agent.status(label=label), "Auto-switch", "auto")
+
+
+def _print_service_status(result: dict, name: str, subcommand: str) -> int:
     if not result["installed"] and not result["loaded"]:
-        print("Menu bar service is not installed.")
-        print(dimmed("Install it with: ccswap menubar --install-service"))
+        print(f"{name} service is not installed.")
+        print(dimmed(f"Install it with: ccswap {subcommand} --install-service"))
         return 0
     state = result["state"] or ("loaded" if result["loaded"] else "stopped")
     pid = f" (pid {result['pid']})" if result["pid"] else ""
-    print(f"Menu bar service: {state}{pid}")
+    print(f"{name} service: {state}{pid}")
     print(f"  plist: {result['plist']}")
     if not result["installed"]:
         print(dimmed("launchd still has it loaded, but the plist is gone."))
@@ -1173,6 +1489,12 @@ def _menubar_service(args) -> int:
 
 def main() -> None:
     """Main entry point for the CLI."""
+    # Claude Code's statusLine command: local reads only, so it runs before
+    # TLS setup, theme probing, and anything else that could print or block.
+    if sys.argv[1:2] == ["statusline"]:
+        from claude_swap.statusline import main as statusline_main
+
+        sys.exit(statusline_main())
     force_utf8_output()
     _use_native_tls()
     argv = sys.argv[1:]
@@ -1196,6 +1518,9 @@ def main() -> None:
         return
     if argv and argv[0] == "antigravity":
         _antigravity_command(argv[1:])
+        return
+    if argv and argv[0] == "agy":
+        _agy_command(argv[1:])
         return
     if argv and argv[0] == "auto":
         _auto_command(argv[1:])
@@ -1246,7 +1571,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog=_prog_name(),
         usage="%(prog)s <command> [args] [options]",
-        description="""Multi-Account Switcher for Claude Code and Codex
+        description="""Multi-Account Switcher for Claude Code, Codex and Antigravity
 
 Commands:
   %(prog)s help                       show this help
@@ -1276,11 +1601,13 @@ Commands:
   %(prog)s unclaimed [--purge ID]     list or drop stashed credential entries
   %(prog)s export <path>              export accounts
   %(prog)s import <path>              import accounts
+  %(prog)s import-usage <path>        adopt usage another machine read (list --json)
   %(prog)s tui                        interactive dashboard (also: bare %(prog)s)
   %(prog)s watch                      dashboard, opened on the live watch page
   %(prog)s sessions                   live Claude sessions: titles, tokens, processes
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
+  %(prog)s auto --install-service     keep auto-switch running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all ccswap data
 
@@ -1289,15 +1616,18 @@ Aliases: ls=list  rm=remove  update=upgrade""",
         epilog="""Flags combine with subcommands:
   %(prog)s switch --strategy best           # pick the account with most quota left
   %(prog)s switch --strategy next-available # rotate, skipping rate-limited accounts
+  %(prog)s switch --strategy consume-first  # use the soonest-resetting weekly quota first
   %(prog)s switch user@example.com
   %(prog)s list --token-status
   %(prog)s list --json
+  %(prog)s import-usage usage.json --hold 600  # adopt another machine's list --json
   %(prog)s add --slot 3                      # add to a specific slot
   %(prog)s add-token sk-ant-oat01-... --email me@example.com
   %(prog)s run 2 -- --resume                 # forward args after '--' to claude
   %(prog)s auto --once                       # single auto-switch tick (cron-friendly)
   %(prog)s config set autoswitch.threshold 80
   %(prog)s codex switch 2                    # switch the file-backed Codex login
+  %(prog)s codex switch --strategy best      # pick Codex quota headroom
 
 The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep working.
         """,
@@ -1324,29 +1654,31 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=(
             "Emit machine-readable JSON to stdout (use with 'list', 'status', "
-            "or 'switch'). See README 'JSON output for scripting'."
+            "or 'switch'). See docs/json.md."
         ),
     )
     parser.add_argument(
         "--provider",
-        choices=["claude", "codex", "all"],
+        choices=["claude", "codex", "agy", "all"],
         default="all",
-        metavar="{claude,codex,all}",
+        metavar="{claude,codex,agy,all}",
         help=(
             "Which provider 'list' covers. 'all' (default) merges Claude Code "
-            "and Codex; 'claude' or 'codex' restricts to one. In --json mode a "
+            "and Codex with Antigravity; 'claude', 'codex' or 'agy' restricts to one. In --json mode a "
             "single provider emits that provider's bare payload; 'all' nests "
-            "both under 'claude'/'codex' keys."
+            "them under 'claude'/'codex'/'agy' keys."
         ),
     )
     parser.add_argument(
         "--strategy",
-        choices=["best", "next-available"],
-        metavar="{best,next-available}",
+        choices=["best", "next-available", "consume-first"],
+        metavar="{best,next-available,consume-first}",
         help=(
             "With bare 'switch': pick the target by remaining 5h/7d quota. "
             "'best' jumps to the account with the most headroom; "
-            "'next-available' rotates to the next account, skipping any at their limit"
+            "'next-available' rotates to the next account, skipping any at their limit; "
+            "'consume-first' jumps to the account with headroom whose weekly "
+            "window resets soonest, so no quota is lost at a reset"
         ),
     )
     parser.add_argument(
@@ -1397,6 +1729,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
+    )
+    parser.add_argument(
+        "--hold",
+        type=float,
+        metavar="SECONDS",
+        help=(
+            "With 'import-usage': keep this machine from fetching the "
+            "imported accounts for this many seconds (0 lifts an earlier hold)"
+        ),
     )
     parser.add_argument(
         "--install-service",
@@ -1484,6 +1825,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=argparse.SUPPRESS,
     )
     group.add_argument(
+        "--import-usage",
+        metavar="PATH",
+        help=argparse.SUPPRESS,
+    )
+    group.add_argument(
         "--tui",
         action="store_true",
         help=argparse.SUPPRESS,
@@ -1539,6 +1885,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         or args.switch_to is not None
         or args.export is not None
         or args.import_ is not None
+        or args.import_usage is not None
         or args.add_token is not None
     ):
         parser.error("no command given — try '%(prog)s help'" % {"prog": _prog_name()})
@@ -1549,8 +1896,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.provider != "all" and not args.list:
         parser.error("--provider can only be used with 'list'")
 
-    if args.token_status and args.provider == "codex":
-        parser.error("--token-status applies to Claude Code, not '--provider codex'")
+    if args.token_status and args.provider in ("codex", "agy"):
+        parser.error("--token-status applies only to Claude Code")
 
     if args.json and not (args.list or args.status or args.switch or args.switch_to):
         parser.error("--json can only be used with 'list', 'status', or 'switch'")
@@ -1567,8 +1914,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         # Meaningless on a direct-target switch or plain rotation — nothing
         # usage-aware reads it there, so reject loudly rather than ignore.
         parser.error(
-            "--model can only be used with 'switch --strategy best' or "
-            "'switch --strategy next-available'"
+            "--model can only be used with 'switch --strategy best', "
+            "'next-available' or 'consume-first'"
         )
 
     if args.slot is not None and not (args.add_account or args.add_token is not None):
@@ -1588,6 +1935,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
+
+    if args.hold is not None and args.import_usage is None:
+        parser.error("--hold can only be used with 'import-usage'")
+
+    if args.hold is not None and not (math.isfinite(args.hold) and args.hold >= 0):
+        parser.error("--hold must be a non-negative number of seconds")
 
     if (
         args.install_service or args.uninstall_service or args.service_status
@@ -1615,6 +1968,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # JSON-capable commands return a payload; the CLI is the single point that
     # serializes it (so no command writes JSON to stdout itself).
     payload: dict | None = None
+    switched_from: str | None = None  # active slot before a switch, for the star prompt
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
 
@@ -1653,6 +2007,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             else:
                 models = parse_model_names(load_settings(switcher.backup_dir).model)
                 model_source = "autoswitch.model" if models else None
+            switched_from = (switcher._get_sequence_data() or {}).get("activeAccountNumber")
             payload = switcher.switch(
                 strategy=args.strategy,
                 json_output=args.json,
@@ -1663,6 +2018,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["models"] = list(models)
                 payload["modelSource"] = model_source
         elif args.switch_to:
+            switched_from = (switcher._get_sequence_data() or {}).get("activeAccountNumber")
             payload = switcher.switch_to(
                 args.switch_to, json_output=args.json, force=args.force
             )
@@ -1678,6 +2034,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             from claude_swap.transfer import import_accounts
 
             import_accounts(switcher, args.import_, force=args.force)
+        elif args.import_usage:
+            from claude_swap.transfer import import_usage
+
+            import_usage(switcher, args.import_usage, hold_s=args.hold)
         elif args.tui:
             from claude_swap.tui import run as tui_run
 
@@ -1722,11 +2082,26 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.json and payload is not None:
         print(json.dumps(payload, indent=2))
 
+    if (
+        switched_from is not None
+        and not args.json
+        and load_ui_settings(paths.get_backup_root()).star_prompt
+    ):
+        from claude_swap.star_prompt import maybe_ask
+
+        maybe_ask(switcher, str(switched_from))
+
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
     # the directory we just deleted. Skipped after --upgrade as a safety guard
-    # in case the dispatch is later refactored to fall through.
-    if not args.purge and not args.upgrade and not args.json:
+    # in case the dispatch is later refactored to fall through. Skipped when
+    # `updates.check` is false, so no request goes to PyPI at all.
+    if (
+        not args.purge
+        and not args.upgrade
+        and not args.json
+        and load_update_settings(paths.get_backup_root()).check
+    ):
         from claude_swap.update_check import check_for_update
 
         msg = check_for_update(__version__)
