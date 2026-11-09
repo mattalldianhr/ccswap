@@ -388,7 +388,35 @@ def account_card_text(
         text.append("\n    ")
         text.append(tr("Resets "), style=palette.muted)
         text.append(resets, style=palette.foreground)
+    for note, warn in limit_detail_notes(acc.usage.last_good):
+        text.append("\n    ")
+        text.append(note, style=palette.sev_warn if warn else palette.muted)
     return text
+
+
+def limit_detail_notes(last_good: dict | None) -> list[tuple[str, bool]]:
+    """``(note, is_warning)`` lines from ``usage["details"]`` (see
+    ``oauth.usage_details``): the same facts `ccswap list` adds, kept to
+    one short line each. Reset history is `ccswap resets`, not here: it
+    reads the whole history file, too slow for a render path."""
+    details = last_good.get("details") if isinstance(last_good, dict) else None
+    if not isinstance(details, dict):
+        return []
+    notes: list[tuple[str, bool]] = []
+    if details.get("five_hour_idle") and not last_good.get("five_hour"):
+        notes.append(("5h idle · next message opens the window", False))
+    if details.get("seven_day_locked"):
+        notes.append((f"⚠ 7d locked: {details['seven_day_locked']}", True))
+    for lim in details.get("limits") or []:
+        if lim.get("severity") not in (None, "normal"):
+            notes.append((f"⚠ {lim.get('model') or lim.get('kind')} at {lim['severity']}", True))
+    extra = details.get("extra_usage")
+    if isinstance(extra, dict) and not extra.get("enabled") and "limit" in extra:
+        why = str(extra.get("disabled_reason") or "off").replace("_", " ")
+        notes.append((f"Overage off ({why})", False))
+    for key in sorted(details.get("other") or {}):
+        notes.append((f"⚠ new API field '{key}' · see ccswap resets", True))
+    return notes
 
 
 def mini_account_text(

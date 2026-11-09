@@ -178,3 +178,16 @@ class TestUsageDetails:
         assert "of weekly so far" in text
         assert "(binding)" in text
         assert "Claude Code 100%" in text
+
+
+def test_tui_notes_from_details():
+    from claude_swap.tui.widgets import limit_detail_notes
+
+    data = json.loads(FIXTURE.read_text())
+    data["tangelo"] = {"x": 1}
+    notes = limit_detail_notes(oauth.build_usage_result(data))
+    text = [n for n, _ in notes]
+    assert text[0].startswith("5h idle")
+    assert "Overage off (out of credits)" in text
+    assert any("tangelo" in n and warn for n, warn in notes)
+    assert limit_detail_notes({"five_hour": {"pct": 1}}) == []
