@@ -106,7 +106,7 @@ class TestDetect:
             s(5 * D, d7=50, d7_due=7 * D, scoped={"Fable": 90}),
             s(5 * D + 180, d7=50, d7_due=7 * D, scoped={"Fable": 0}),
         ])
-        assert [(e.window, e.kind) for e in ev] == [("Fable", "early")]
+        assert [(e.window, e.kind) for e in ev if e.unscheduled] == [("Fable", "early")]
 
     def test_accounts_are_independent(self):
         ev = resets.detect([
@@ -191,3 +191,53 @@ def test_tui_notes_from_details():
     assert "Overage off (out of credits)" in text
     assert any("tangelo" in n and warn for n, warn in notes)
     assert limit_detail_notes({"five_hour": {"pct": 1}}) == []
+
+
+class TestInferredWeeklySchedule:
+    """Readings from before ccswap stored resets_at (pre 11 Sep) carry no
+    reset time. The weekly window resets at a fixed weekly time, so the
+    schedule is worked back from the first reading that has one."""
+
+    def test_early_drop_without_reset_time_uses_inferred_schedule(self):
+        # Shape seen on 4 Sep: 100% -> 0% on a Thursday for an account whose
+        # weekly reset is Tuesday; resets_at only recorded from a week later.
+        ev = resets.detect([
+            s(3 * D, d7=100),
+            s(3 * D + 120, d7=0),
+            s(10 * D, d7=20, d7_due=13 * D),
+        ])
+        early = [e for e in ev if e.window == "7d" and e.unscheduled]
+        assert [e.kind for e in early] == ["early"]
+        assert early[0].due_inferred
+        assert abs(early[0].due_before - (T0 + 6 * D)) < 1
+        assert "inferred" in resets.describe(early[0])
+
+    def test_on_schedule_drop_without_reset_time_is_scheduled(self):
+        ev = resets.detect([
+            s(6 * D - 60, d7=100),
+            s(6 * D + 120, d7=0),
+            s(10 * D, d7=20, d7_due=13 * D),
+        ])
+        assert [e for e in ev if e.unscheduled] == []
+
+    def test_no_known_reset_time_means_no_inference(self):
+        ev = resets.detect([s(3 * D, d7=100), s(3 * D + 120, d7=0)])
+        assert ev == []
+
+    def test_scoped_window_uses_inferred_anchor(self):
+        ev = resets.detect([
+            s(3 * D, d7=50, scoped={"Fable": 90}),
+            s(3 * D + 120, d7=50, scoped={"Fable": 0}),
+            s(10 * D, d7=20, d7_due=13 * D, scoped={"Fable": 1}),
+        ])
+        assert [(e.window, e.kind) for e in ev if e.unscheduled] == [("Fable", "early")]
+
+    def test_stale_reading_just_after_boundary_is_not_early(self):
+        # Shape seen on 9 Sep: a reading 30s past the weekly boundary still
+        # shows the old window; the drop appears on the next poll.
+        ev = resets.detect([
+            s(6 * D + 30, d7=88),
+            s(6 * D + 150, d7=0),
+            s(10 * D, d7=20, d7_due=13 * D),
+        ])
+        assert [e for e in ev if e.unscheduled] == []

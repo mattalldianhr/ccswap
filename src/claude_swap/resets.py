@@ -48,6 +48,7 @@ ZERO_PCT = 1.0
 # reset: after a long poll gap the account may have spent a little of the
 # fresh window before the next sample (83% -> 3% across a 17h gap).
 FULL_SHARE = 0.8
+WEEK_S = 7 * 86400.0
 
 WINDOWS = ("5h", "7d")
 
@@ -63,6 +64,9 @@ class ResetEvent:
     pct_after: float
     due_before: float | None  # the reset time in force before the event
     due_after: float | None
+    # True when due_before was worked back from the weekly schedule because
+    # the reading carried no reset time (history from before 11 Sep 2026).
+    due_inferred: bool = False
 
     @property
     def unscheduled(self) -> bool:
@@ -90,6 +94,7 @@ class ResetEvent:
             "dueBefore": iso(self.due_before),
             "dueAfter": iso(self.due_after),
             "earlyBySeconds": self.early_by_s if self.unscheduled else None,
+            "dueInferred": self.due_inferred,
         }
 
 
@@ -116,6 +121,34 @@ def _series(samples: Sequence[Sample], window: str) -> list[tuple[float, float, 
             continue
         out.append((s.t, pct, reset))
     return out
+
+
+def _weekly_due(t: float, known: Sequence[float]) -> float | None:
+    """The weekly reset after ``t``, worked back (or forward) from the
+    nearest known 7d reset time. ``known`` is sorted."""
+    if not known:
+        return None
+    later = [r for r in known if r > t]
+    ref = later[0] if later else known[-1]
+    # Shift ref by whole weeks into (t, t + WEEK].
+    weeks = (ref - t) // WEEK_S if ref > t else -((t - ref) // WEEK_S) - 1
+    due = ref - weeks * WEEK_S
+    return due if due > t else due + WEEK_S
+
+
+def _infer_weekly(points: list[tuple[float, float, float | None]], known: Sequence[float]):
+    """Fill missing 7d reset times from the weekly schedule. Returns the new
+    points and the set of sample times whose reset time was inferred."""
+    out, inferred = [], set()
+    for t, pct, due in points:
+        if due is None:
+            # Back off by the grace period: a reading just past the boundary
+            # can still show the old window, as a stamped one would.
+            due = _weekly_due(t - GRACE_S, known)
+            if due is not None:
+                inferred.add(t)
+        out.append((t, pct, due))
+    return out, inferred
 
 
 def classify(
@@ -168,11 +201,27 @@ def detect(samples: Iterable[Sample], windows: Sequence[str] | None = None) -> l
             {name for s in rows for name in s.scoped}
         )
         # Scoped windows reset with the weekly window; use its schedule.
-        seven = {s.t: _ts(s.seven_day_reset) for s in rows}
+        # Readings without a 7d reset time get one from the weekly schedule.
+        known = sorted({r for s in rows if (r := _ts(s.seven_day_reset)) is not None})
+        inferred: set[float] = set()
+        seven = {}
+        for s in rows:
+            due = _ts(s.seven_day_reset)
+            if due is None:
+                due = _weekly_due(s.t - GRACE_S, known)
+                if due is not None:
+                    inferred.add(s.t)
+            seven[s.t] = due
         for window in names:
             points = _series(rows, window)
+            if window == "7d":
+                points, _ = _infer_weekly(points, known)
             for prev, cur in zip(points, points[1:]):
                 anchor = seven.get(prev[0]) if window not in WINDOWS else None
+                if window == "7d" and prev[0] in inferred and cur[0] in inferred:
+                    # Both reset times are inferred, so they always agree:
+                    # only a drop can be an event, never a moved schedule.
+                    cur = (cur[0], cur[1], prev[2])
                 kind = classify(prev, cur, anchor_due=anchor)
                 if kind is None:
                     continue
@@ -182,6 +231,7 @@ def detect(samples: Iterable[Sample], windows: Sequence[str] | None = None) -> l
                     pct_before=prev[1], pct_after=cur[1],
                     due_before=prev[2] if prev[2] is not None else anchor,
                     due_after=cur[2],
+                    due_inferred=(window != "5h" and prev[0] in inferred),
                 ))
     # A scoped (per-model) drop seen at the same moment as a 7d event is the
     # weekly reset seen twice: keep the 7d one.
@@ -228,6 +278,8 @@ def describe(e: ResetEvent) -> str:
     early = e.early_by_s
     if e.unscheduled and early and e.due_before is not None:
         text += f", {_span(early)} before its {_clock(e.due_before)} reset"
+        if e.due_inferred:
+            text += " (schedule inferred: reading had no reset time)"
     gap = e.observed_at - e.after
     if gap > 3600:
         text += f" (seen after a {_span(gap)} gap)"
