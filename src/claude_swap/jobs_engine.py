@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from claude_swap.capacity import (
+    WINDOW_7D,
     AccountCapacity,
     PooledWindow,
     account_capacity,
@@ -248,6 +249,8 @@ class IdleReport:
     busy: tuple[ClaudeSession, ...] = ()
     unreadable: int = 0
     stale_busy: int = 0  # `busy` records too old to believe
+    # Idle seconds per config root that has interactive sessions (0 = busy).
+    by_root: tuple[tuple[Path, float], ...] = ()
 
 
 def interactive_idle(
@@ -273,9 +276,12 @@ def interactive_idle(
     busy: list[ClaudeSession] = []
     unreadable = 0
     stale_busy = 0
+    by_root: list[tuple[Path, float]] = []
     for root in (claude_home, *profile_dirs):
         sessions, bad = scan_sessions(claude_dir=root)
         unreadable += bad
+        root_busy = False
+        root_newest: float | None = None
         for s in sessions:
             if s.pid in exclude_pids or s.kind != "interactive":
                 continue
@@ -285,16 +291,25 @@ def interactive_idle(
                     stale_busy += 1  # killed mid-turn; not actually working
                 else:
                     busy.append(s)
+                    root_busy = True
             if stamp is not None:
                 newest_status = stamp if newest_status is None else max(newest_status, stamp)
+                root_newest = stamp if root_newest is None else max(root_newest, stamp)
+        if root_busy:
+            by_root.append((root, 0.0))
+        elif root_newest is not None:
+            by_root.append((root, max(0.0, now - root_newest)))
+    roots = tuple(by_root)
     if busy:
-        return IdleReport(idle_s=0.0, busy=tuple(busy), unreadable=unreadable, stale_busy=stale_busy)
+        return IdleReport(idle_s=0.0, busy=tuple(busy), unreadable=unreadable, stale_busy=stale_busy, by_root=roots)
     if newest_status is None:
         return IdleReport(
             idle_s=float("inf") if unreadable == 0 else None,
-            unreadable=unreadable, stale_busy=stale_busy,
+            unreadable=unreadable, stale_busy=stale_busy, by_root=roots,
         )
-    return IdleReport(idle_s=max(0.0, now - newest_status), unreadable=unreadable, stale_busy=stale_busy)
+    return IdleReport(
+        idle_s=max(0.0, now - newest_status), unreadable=unreadable, stale_busy=stale_busy, by_root=roots,
+    )
 
 
 def _status_updated_at(root: Path, pid: int) -> float | None:
@@ -400,6 +415,18 @@ class JobsEngine:
         """Store-only capacity for every enabled OAuth account."""
         now = self.clock() if now is None else now
         entries = self.switcher.usage_entries_by_account(fetch=set())
+        # A reading too old to trust makes its account ineligible. Other
+        # pollers refresh on their own schedule, so ask for those accounts
+        # now rather than hold a job on capacity that is probably there.
+        stale = {
+            num for num, e in entries.items()
+            if e is not None and e.age_s is not None and e.age_s > USAGE_TRUST_S
+        }
+        if stale:
+            try:
+                entries = self.switcher.usage_entries_by_account(fetch=stale)
+            except ClaudeSwitchError:
+                logger.debug("usage refresh failed; using stored readings", exc_info=True)
         # Apply the learned weekly reserve, if there is one, by handing the
         # capacity builder a settings object with that floor.
         learned = self.learned_reserve()
@@ -447,6 +474,40 @@ class JobsEngine:
             exclude_pids=exclude,
         )
 
+    def _busy_accounts(self, idle: IdleReport) -> set[str] | None:
+        """Slots an interactive session is spending from (busy, or idle for
+        less than the quiet period). ``None`` = cannot tell, block them all."""
+        need = self.settings.quiet_minutes * 60.0
+        home = self._claude_home_dir()
+        out: set[str] = set()
+        for root, idle_s in idle.by_root:
+            if idle_s >= need:
+                continue
+            if root == home:
+                num = self.switcher.current_account_number()
+            else:
+                # Session profiles are named "<slot>-<email slug>".
+                num = root.name.split("-", 1)[0]
+                num = num if num.isdigit() else None
+            if num is None:
+                return None
+            out.add(str(num))
+        return out
+
+    def _spend_down_caps(self, caps: list[AccountCapacity]) -> list[AccountCapacity]:
+        """Accounts whose weekly window is about to reset with budget left."""
+        hours = self.settings.spend_down_hours
+        if hours <= 0:
+            return []
+        out = []
+        for cap in caps:
+            w = cap.window(WINDOW_7D)
+            if w is None or w.used_pct is None or w.remaining_s is None:
+                continue
+            if w.remaining_s <= hours * 3600.0 and 100.0 - w.used_pct >= self.settings.spend_down_min_left_pct:
+                out.append(cap)
+        return out
+
     # -- policy ----------------------------------------------------------------
 
     def _need(self, job: Job, window: str) -> float:
@@ -489,6 +550,8 @@ class JobsEngine:
                 pinned = self.switcher.resolve_account(job.account)
             except ClaudeSwitchError:
                 return None
+        if job.spend_down:
+            capacities = self._spend_down_caps(capacities)
         eligible = [
             cap for cap in capacities
             if (pinned is None or cap.number == pinned[0])
@@ -545,13 +608,22 @@ class JobsEngine:
         idle = self.idle(now=now)
         quiet = idle.idle_s is not None and idle.idle_s >= self.settings.quiet_minutes * 60.0
         caps = self.capacities(now=now) if queued else []
+        # Spend-down jobs wait, like a cooldown, until a weekly window is
+        # about to reset with budget left.
+        waiting_spend = []
+        if any(j.spend_down for j in queued):
+            if not self._spend_down_caps(caps):
+                waiting_spend = [j for j in queued if j.spend_down]
+                queued = [j for j in queued if not j.spend_down]
         self._emit(TickEvent(
             queued=len(queued), running=len(running), idle_s=None if idle.idle_s == float("inf") else idle.idle_s,
             quiet=quiet, capacities=tuple(caps),
         ))
         if not queued:
-            if held or budgeted:
+            if held or budgeted or waiting_spend:
                 bits = []
+                if waiting_spend:
+                    bits.append(f"{len(waiting_spend)} waiting for a spend-down window")
                 if held:
                     soonest = min(j.not_before or now for j in held)
                     bits.append(f"{len(held)} waiting for cooldown (next in {max(0.0, soonest - now) / 60:.0f}m)")
@@ -566,6 +638,11 @@ class JobsEngine:
         if idle.idle_s is None:
             self._emit(HoldEvent(reason="idle-unknown", detail=f"{idle.unreadable} unreadable session records"))
             return TickOutcome.HELD
+        if not quiet and self.settings.quiet_scope == "account":
+            blocked = self._busy_accounts(idle)
+            free = [] if blocked is None else [c for c in caps if c.number not in blocked]
+            if free:
+                caps, quiet = free, True
         if not quiet:
             busy = ", ".join(sorted({s.cwd.rsplit("/", 1)[-1] for s in idle.busy})) if idle.busy else ""
             detail = f"busy: {busy}" if busy else f"idle {idle.idle_s / 60:.0f}m < {self.settings.quiet_minutes:.0f}m"

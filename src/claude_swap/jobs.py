@@ -154,6 +154,9 @@ class Job:
     # Budget: skip auto-starts once this job's measured 7d cost over the
     # last 7 days reaches this many pct points (None = unlimited).
     weekly_budget_pct: float | None = None
+    # Spend-down: auto-start only on an account whose weekly window is about
+    # to reset with budget left (jobs.spendDownHours / spendDownMinLeftPct).
+    spend_down: bool = False
 
     # -- derived --------------------------------------------------------------
 
@@ -249,6 +252,7 @@ class Job:
             not_before=_num_or_none(raw.get("not_before")),
             then_job=raw.get("then_job") if isinstance(raw.get("then_job"), str) and raw.get("then_job") else None,
             weekly_budget_pct=_num_or_none(raw.get("weekly_budget_pct")),
+            spend_down=bool(raw.get("spend_down", False)),
         )
 
 

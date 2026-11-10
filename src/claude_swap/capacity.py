@@ -345,8 +345,13 @@ def account_capacity(
 
     five = last_good.get("five_hour")
     seven = last_good.get("seven_day")
+    five_pct = pct(five)
+    if five is None and pct(seven) is not None:
+        # The API omits five_hour until the next message opens a window:
+        # an idle window is entirely unused, not unknown.
+        five_pct = 0.0
     windows[WINDOW_5H] = window_capacity(
-        window=WINDOW_5H, used_pct=pct(five), resets_at=reset(five), now=now,
+        window=WINDOW_5H, used_pct=five_pct, resets_at=reset(five), now=now,
         samples=samples, settings=settings, reserves=reserves, email=email,
         floor_pct=settings.reserve_pct,
     )

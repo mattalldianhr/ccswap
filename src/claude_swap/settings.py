@@ -131,6 +131,13 @@ class JobsSettings:
     # them (learned.py). It can only ever hold back *less* than the configured
     # floor, never more, so this is safe to leave on.
     learn_reserve: bool = True
+    # "account": a busy interactive session blocks only the account it is
+    # spending from; "all": any busy session holds the whole queue.
+    quiet_scope: str = "account"
+    # Spend-down jobs run only on an account whose weekly window resets
+    # within this many hours (0 disables) with at least this much left.
+    spend_down_hours: float = 24.0
+    spend_down_min_left_pct: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -365,6 +372,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "jobs", "learnReserve", "learn_reserve", "bool",
             help="Learn the weekly reserve from recorded usage cycles",
+        ),
+        SettingSpec(
+            "jobs", "quietScope", "quiet_scope", "choice",
+            choices=("account", "all"),
+            help="A busy session blocks only its own account, or every account",
+        ),
+        SettingSpec(
+            "jobs", "spendDownHours", "spend_down_hours", "float", 0.0, 168.0,
+            help="Spend-down jobs run this close to a weekly reset (0 = never)",
+        ),
+        SettingSpec(
+            "jobs", "spendDownMinLeftPct", "spend_down_min_left_pct", "float", 0.0, 100.0,
+            help="Spend-down jobs need this much of the 7d window still unspent",
         ),
     )
 }

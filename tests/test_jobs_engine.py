@@ -124,7 +124,10 @@ class TestTick:
 
     def test_hold_when_not_quiet(self, harness, tmp_path):
         entries = {"1": _entry(10, 10, now=NOW), "2": _entry(10, 10, now=NOW)}
-        engine, store, events, p = _engine(harness, tmp_path, entries=entries)
+        engine, store, events, p = _engine(
+            harness, tmp_path, entries=entries,
+            settings=JobsSettings(quiet_minutes=10, reserve_pct=10, weekly_reserve_pct=10, quiet_scope="all"),
+        )
         _queue(store, tmp_path)
         _session_file(tmp_path / "claude-home", os.getpid(), status="busy", updated_ms=NOW * 1000)
         try:
@@ -434,3 +437,202 @@ class TestLearnedReserveApplied:
             p.stop()
         assert learned.reason == "unavailable"
         assert learned.pct == engine.settings.weekly_reserve_pct
+
+
+def _entry_at(five, seven, *, now, weekly_reset_in, age=10.0):
+    lg = {"seven_day": {"pct": seven, "resets_at": _iso(now + weekly_reset_in)}}
+    if five is not None:
+        lg["five_hour"] = {"pct": five, "resets_at": _iso(now + 4 * 3600)}
+    return UsageEntry(last_good=lg, fetched_at=now - age, age_s=age)
+
+
+class TestIdleFiveHourWindow:
+    """The API omits five_hour until the next message opens a window. That
+    is 0% used, not unknown: seen 9 Nov holding a 1% job with 81% spare."""
+
+    def test_idle_5h_window_counts_as_unused(self, harness, tmp_path):
+        entries = {
+            "1": _entry(95, 95, now=NOW),
+            "2": _entry_at(None, 20, now=NOW, weekly_reset_in=3 * 86400),
+        }
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        try:
+            assert engine.tick() is TickOutcome.STARTED
+        finally:
+            p.stop()
+        assert events[-1].account == "b@example.com"
+
+    def test_no_usage_at_all_stays_unknown(self, harness, tmp_path):
+        entries = {"1": UsageEntry(last_good={}, fetched_at=NOW - 10, age_s=10.0)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        try:
+            assert engine.tick() is TickOutcome.HELD
+        finally:
+            p.stop()
+
+
+class TestStaleUsageRefresh:
+    def test_stale_reading_is_refreshed_before_deciding(self, harness, tmp_path):
+        stale = {"1": _entry(10, 10, now=NOW, age=600), "2": _entry(10, 10, now=NOW, age=600)}
+        fresh = {"1": _entry(10, 10, now=NOW), "2": _entry(10, 10, now=NOW)}
+        calls = []
+
+        def fake(fetch=None, **kw):
+            calls.append(fetch)
+            return fresh if fetch else stale
+
+        events: list = []
+        store = JobStore(harness.switcher.backup_dir)
+        engine = JobsEngine(
+            harness.switcher, JobsSettings(quiet_minutes=0), events.append,
+            store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+        )
+        _queue(store, tmp_path)
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=fake):
+            assert engine.tick() is TickOutcome.STARTED
+        assert calls == [set(), {"1", "2"}]
+
+    def test_fresh_readings_are_not_refetched(self, harness, tmp_path):
+        fresh = {"1": _entry(10, 10, now=NOW), "2": _entry(10, 10, now=NOW)}
+        calls = []
+
+        def fake(fetch=None, **kw):
+            calls.append(fetch)
+            return fresh
+
+        store = JobStore(harness.switcher.backup_dir)
+        engine = JobsEngine(
+            harness.switcher, JobsSettings(quiet_minutes=0), lambda e: None,
+            store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+        )
+        _queue(store, tmp_path)
+        with patch.object(harness.switcher, "usage_entries_by_account", side_effect=fake):
+            engine.tick()
+        assert calls == [set()]
+
+
+class TestQuietScopeAccount:
+    """A busy session blocks only the account it is spending from."""
+
+    def _profile(self, harness, name):
+        d = harness.switcher.backup_dir / "sessions" / name
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def test_busy_default_login_leaves_the_other_account_free(self, harness, tmp_path):
+        entries = {"1": _entry(10, 10, now=NOW), "2": _entry(40, 40, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        _session_file(tmp_path / "claude-home", os.getpid(), status="busy", updated_ms=NOW * 1000)
+        try:
+            assert engine.tick() is TickOutcome.STARTED
+        finally:
+            p.stop()
+        assert events[-1].account == "b@example.com"  # a@ has more room but is in use
+
+    def test_recently_idle_account_is_still_blocked(self, harness, tmp_path):
+        entries = {"1": _entry(10, 10, now=NOW), "2": _entry(40, 40, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        _session_file(tmp_path / "claude-home", os.getpid(), status="idle", updated_ms=(NOW - 60) * 1000)
+        try:
+            assert engine.tick() is TickOutcome.STARTED
+        finally:
+            p.stop()
+        assert events[-1].account == "b@example.com"
+
+    def test_all_accounts_busy_holds(self, harness, tmp_path):
+        entries = {"1": _entry(10, 10, now=NOW), "2": _entry(10, 10, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        _session_file(tmp_path / "claude-home", os.getpid(), status="busy", updated_ms=NOW * 1000)
+        _session_file(self._profile(harness, "2-b_example.com"), os.getppid(), status="busy", updated_ms=NOW * 1000)
+        try:
+            assert engine.tick() is TickOutcome.HELD
+        finally:
+            p.stop()
+        assert events[-1].reason == "not-quiet"
+
+    def test_profile_session_blocks_its_own_account(self, harness, tmp_path):
+        entries = {"1": _entry(40, 40, now=NOW), "2": _entry(10, 10, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        _session_file(self._profile(harness, "2-b_example.com"), os.getpid(), status="busy", updated_ms=NOW * 1000)
+        try:
+            assert engine.tick() is TickOutcome.STARTED
+        finally:
+            p.stop()
+        assert events[-1].account == "a@example.com"
+
+    def test_unmanaged_login_blocks_everything(self, harness, tmp_path):
+        entries = {"1": _entry(10, 10, now=NOW), "2": _entry(10, 10, now=NOW)}
+        engine, store, events, p = _engine(harness, tmp_path, entries=entries, dry_run=True)
+        _queue(store, tmp_path)
+        _session_file(tmp_path / "claude-home", os.getpid(), status="busy", updated_ms=NOW * 1000)
+        try:
+            with patch.object(harness.switcher, "current_account_number", return_value=None):
+                assert engine.tick() is TickOutcome.HELD
+        finally:
+            p.stop()
+        assert events[-1].reason == "not-quiet"
+
+
+class TestSpendDown:
+    """A spend-down job runs only on an account whose weekly window is about
+    to reset with budget left: capacity that is lost if nothing uses it."""
+
+    def _run(self, harness, tmp_path, entries, **settings):
+        events: list = []
+        store = JobStore(harness.switcher.backup_dir)
+        engine = JobsEngine(
+            harness.switcher, JobsSettings(quiet_minutes=0, **settings), events.append,
+            store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+        )
+        _queue(store, tmp_path, spend_down=True)
+        with patch.object(harness.switcher, "usage_entries_by_account", return_value=entries):
+            return engine.tick(), events
+
+    def test_waits_outside_the_window(self, harness, tmp_path):
+        entries = {
+            "1": _entry_at(5, 20, now=NOW, weekly_reset_in=3 * 86400),
+            "2": _entry_at(5, 20, now=NOW, weekly_reset_in=5 * 86400),
+        }
+        outcome, events = self._run(harness, tmp_path, entries)
+        assert outcome is TickOutcome.HELD
+        assert events[-1].reason == "held" and "spend-down" in events[-1].detail
+
+    def test_runs_on_the_expiring_account(self, harness, tmp_path):
+        entries = {
+            "1": _entry_at(5, 5, now=NOW, weekly_reset_in=5 * 86400),  # more room, not expiring
+            "2": _entry_at(5, 40, now=NOW, weekly_reset_in=10 * 3600),
+        }
+        outcome, events = self._run(harness, tmp_path, entries)
+        assert outcome is TickOutcome.STARTED
+        assert events[-1].account == "b@example.com"
+
+    def test_not_when_little_is_left(self, harness, tmp_path):
+        entries = {
+            "1": _entry_at(5, 5, now=NOW, weekly_reset_in=5 * 86400),
+            "2": _entry_at(5, 90, now=NOW, weekly_reset_in=10 * 3600),
+        }
+        outcome, events = self._run(harness, tmp_path, entries)
+        assert outcome is TickOutcome.HELD
+
+    def test_disabled_by_zero_hours(self, harness, tmp_path):
+        entries = {"2": _entry_at(5, 40, now=NOW, weekly_reset_in=10 * 3600)}
+        outcome, _ = self._run(harness, tmp_path, entries, spend_down_hours=0)
+        assert outcome is TickOutcome.HELD
+
+    def test_normal_jobs_are_unaffected(self, harness, tmp_path):
+        entries = {"1": _entry_at(5, 5, now=NOW, weekly_reset_in=5 * 86400)}
+        events: list = []
+        store = JobStore(harness.switcher.backup_dir)
+        engine = JobsEngine(
+            harness.switcher, JobsSettings(quiet_minutes=0), events.append,
+            store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+        )
+        _queue(store, tmp_path)
+        with patch.object(harness.switcher, "usage_entries_by_account", return_value=entries):
+            assert engine.tick() is TickOutcome.STARTED

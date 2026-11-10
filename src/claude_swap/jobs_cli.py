@@ -85,6 +85,7 @@ Examples:
     p_add.add_argument("--repeat", type=float, metavar="MINUTES", help="Re-queue this long after each successful run")
     p_add.add_argument("--then", dest="then_job", metavar="JOB", help="Re-queue that job when this one succeeds")
     p_add.add_argument("--weekly-budget", type=float, metavar="PCT", help="Skip auto-starts once this job's 7d cost in the last week reaches PCT")
+    p_add.add_argument("--spend-down", action="store_true", help="Auto-start only on an account whose weekly window is about to reset with budget left")
     p_add.add_argument("--", dest="_dashdash", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     p_list = sub.add_parser("list", help="List jobs")
@@ -124,6 +125,7 @@ Examples:
     p_edit.add_argument("--repeat", type=float, metavar="MINUTES", help="0 clears")
     p_edit.add_argument("--then", dest="then_job", metavar="JOB", help="'' clears")
     p_edit.add_argument("--weekly-budget", type=float, metavar="PCT", help="0 clears")
+    p_edit.add_argument("--spend-down", choices=("on", "off"))
 
     p_log = sub.add_parser("log", help="Show a job's output")
     p_log.add_argument("job")
@@ -221,6 +223,7 @@ def _add(args, *, switcher, settings, store, runner) -> int:
         repeat_minutes=args.repeat or None,
         then_job=args.then_job or None,
         weekly_budget_pct=args.weekly_budget or None,
+        spend_down=bool(args.spend_down),
     )
     job = store.add(job)
     print(f"{accent('Queued')} {bolded(job.name)} {muted(job.short_id)} in {job.folder}")
@@ -306,6 +309,8 @@ def _show(args, *, store, settings, **_) -> int:
         loop.append(f"then {job.then_job}")
     if job.weekly_budget_pct:
         loop.append(f"weekly budget {job.weekly_spent(time.time()):.1f}/{job.weekly_budget_pct:g}%")
+    if job.spend_down:
+        loop.append("spend-down only")
     if loop:
         print(f"  loop       {' · '.join(loop)}")
     print(f"  created    {job.created_at}")
@@ -422,6 +427,8 @@ def _edit(args, *, store, switcher, **_) -> int:
         fields["then_job"] = args.then_job or None
     if args.weekly_budget is not None:
         fields["weekly_budget_pct"] = args.weekly_budget or None
+    if args.spend_down is not None:
+        fields["spend_down"] = args.spend_down == "on"
     if not fields:
         error("Error: nothing to change")
         return 1
