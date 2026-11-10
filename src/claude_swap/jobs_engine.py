@@ -550,7 +550,7 @@ class JobsEngine:
                 pinned = self.switcher.resolve_account(job.account)
             except ClaudeSwitchError:
                 return None
-        if job.spend_down:
+        if job.spend_down or job.id in getattr(self, "_over_budget_ids", ()):
             capacities = self._spend_down_caps(capacities)
         eligible = [
             cap for cap in capacities
@@ -604,17 +604,23 @@ class JobsEngine:
         queued = [j for j in jobs if j.state == "queued" and j.auto]
         held = [j for j in queued if not j.ready(now)]
         budgeted = [j for j in queued if j.ready(now) and j.over_budget(now)]
-        queued = [j for j in queued if j.ready(now) and not j.over_budget(now)]
+        queued = [j for j in queued if j.ready(now)]
         idle = self.idle(now=now)
         quiet = idle.idle_s is not None and idle.idle_s >= self.settings.quiet_minutes * 60.0
         caps = self.capacities(now=now) if queued else []
         # Spend-down jobs wait, like a cooldown, until a weekly window is
         # about to reset with budget left.
+        # A weekly budget protects the week's capacity. In a spend-down window
+        # the rest of that account's week is lost anyway, so an over-budget
+        # job may still run there (and only there).
         waiting_spend = []
-        if any(j.spend_down for j in queued):
-            if not self._spend_down_caps(caps):
-                waiting_spend = [j for j in queued if j.spend_down]
-                queued = [j for j in queued if not j.spend_down]
+        over = {j.id for j in budgeted}
+        self._over_budget_ids = over
+        if queued and not self._spend_down_caps(caps):
+            waiting_spend = [j for j in queued if j.spend_down and j.id not in over]
+            queued = [j for j in queued if not j.spend_down and j.id not in over]
+        else:
+            budgeted = []
         self._emit(TickEvent(
             queued=len(queued), running=len(running), idle_s=None if idle.idle_s == float("inf") else idle.idle_s,
             quiet=quiet, capacities=tuple(caps),

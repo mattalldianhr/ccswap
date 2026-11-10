@@ -636,3 +636,29 @@ class TestSpendDown:
         _queue(store, tmp_path)
         with patch.object(harness.switcher, "usage_entries_by_account", return_value=entries):
             assert engine.tick() is TickOutcome.STARTED
+
+    def test_over_budget_job_runs_in_a_spend_down_window(self, harness, tmp_path):
+        from claude_swap.jobs import RunRecord
+
+        def run(entries):
+            events: list = []
+            store = JobStore(harness.switcher.backup_dir)
+            for j in store.all():
+                store.remove(j.id)
+            engine = JobsEngine(
+                harness.switcher, JobsSettings(quiet_minutes=0), events.append,
+                store=store, clock=harness.clock, dry_run=True, claude_home=tmp_path / "ch",
+            )
+            done = datetime.fromtimestamp(NOW - 3600, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _queue(store, tmp_path, weekly_budget_pct=5.0, runs=(RunRecord(
+                started_at=done, finished_at=done, account="a@example.com", exit_code=0, session_id=None, cost_5h=1.0, cost_7d=9.0),))
+            with patch.object(harness.switcher, "usage_entries_by_account", return_value=entries):
+                return engine.tick(), events
+
+        outcome, events = run({"1": _entry_at(5, 20, now=NOW, weekly_reset_in=4 * 86400)})
+        assert outcome is TickOutcome.HELD and "over weekly budget" in events[-1].detail
+        outcome, events = run({
+            "1": _entry_at(5, 5, now=NOW, weekly_reset_in=4 * 86400),
+            "2": _entry_at(5, 40, now=NOW, weekly_reset_in=10 * 3600),
+        })
+        assert outcome is TickOutcome.STARTED and events[-1].account == "b@example.com"
