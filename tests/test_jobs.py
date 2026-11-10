@@ -394,3 +394,21 @@ class TestRunner:
                 break
         with pytest.raises(JobError):
             runner.requeue(store.update(job.id, state="running", worker_pid=os.getpid()))
+
+
+class TestPassthroughArgs:
+    def test_split_at_bare_double_dash(self):
+        from claude_swap.jobs_cli import split_passthrough
+
+        assert split_passthrough(["add", ".", "p", "--", "--add-dir", "/x"]) == (
+            ["add", ".", "p"], ["--add-dir", "/x"])
+        assert split_passthrough(["list"]) == (["list"], [])
+
+    def test_add_stores_claude_args(self, temp_home, tmp_path, capsys):
+        from claude_swap.jobs import JobStore
+        from claude_swap.jobs_cli import jobs_command
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        jobs_command(["add", str(tmp_path), "do it", "-n", "pt", "--", "--add-dir", "/x"])
+        store = JobStore(ClaudeAccountSwitcher().backup_dir)
+        assert store.get("pt").extra_args == ("--add-dir", "/x")

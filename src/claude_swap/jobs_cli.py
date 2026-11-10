@@ -48,6 +48,18 @@ def _prog() -> str:
 # -- jobs ------------------------------------------------------------------------
 
 
+def split_passthrough(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split ``jobs add ... -- <claude args>`` at the first bare ``--``.
+
+    argparse treats ``--`` as "the rest are positionals", so the arguments
+    meant for ``claude`` were rejected as unrecognized instead of stored.
+    """
+    if "--" not in argv:
+        return list(argv), []
+    i = argv.index("--")
+    return list(argv[:i]), list(argv[i + 1:])
+
+
 def jobs_command(argv: list[str]) -> None:
     parser = argparse.ArgumentParser(
         prog=f"{_prog()} jobs",
@@ -86,7 +98,6 @@ Examples:
     p_add.add_argument("--then", dest="then_job", metavar="JOB", help="Re-queue that job when this one succeeds")
     p_add.add_argument("--weekly-budget", type=float, metavar="PCT", help="Skip auto-starts once this job's 7d cost in the last week reaches PCT")
     p_add.add_argument("--spend-down", action="store_true", help="Auto-start only on an account whose weekly window is about to reset with budget left")
-    p_add.add_argument("--", dest="_dashdash", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
 
     p_list = sub.add_parser("list", help="List jobs")
     p_list.add_argument("--all", action="store_true", help="Include finished jobs")
@@ -151,7 +162,9 @@ Examples:
     p_daemon.add_argument("op", choices=("install", "uninstall", "status"))
     p_daemon.add_argument("--interval", type=int, default=300, metavar="SECONDS")
 
+    argv, passthrough = split_passthrough(argv)
     args = parser.parse_args(argv)
+    args._dashdash = passthrough
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         settings = load_jobs_settings(switcher.backup_dir)
